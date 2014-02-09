@@ -1,4 +1,24 @@
 /*
+ * Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+ *
+ * Previously licensed under the ISC license by Qualcomm Atheros, Inc.
+ *
+ *
+ * Permission to use, copy, modify, and/or distribute this software for
+ * any purpose with or without fee is hereby granted, provided that the
+ * above copyright notice and this permission notice appear in all
+ * copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL
+ * WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE
+ * AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL
+ * DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR
+ * PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+ * TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+ * PERFORMANCE OF THIS SOFTWARE.
+ */
+/*
  * Copyright (c) 2012, The Linux Foundation. All rights reserved.
  *
  * Previously licensed under the ISC license by Qualcomm Atheros, Inc.
@@ -28,6 +48,15 @@
 #define WLAN_CFG_FILE              "wlan/prima/WCNSS_cfg.dat"
 #define WLAN_FW_FILE               ""
 #define WLAN_NV_FILE               "wlan/prima/WCNSS_qcom_wlan_nv.bin"
+#define WLAN_NV_DEFAULTFILE        "wlan/prima/WCNSS_qcom_wlan_nv_default.bin"
+#ifdef WLAN_NV_OTA_UPGRADE
+#define WLAN_NV_FILE_REGULATORY    "wlan/prima/WCNSS_qcom_wlan_nv_regulatory.bin"
+#define WLAN_NV_FILE_CALIBRATION  "wlan/prima/WCNSS_qcom_wlan_nv_calibration.bin"
+// BEGIN IKJB42MAIN-9117, qjiang1, 04/10/2013
+#define WLAN_NV_FILE_REGULATORY_M    "wlan/prima/WCNSS_qcom_wlan_nv_regulatory_m.bin"
+#define WLAN_NV_FILE_CALIBRATION_M   "wlan/prima/WCNSS_qcom_wlan_nv_calibration_m.bin"
+// END IKJB42MAIN-9117
+#endif
 #define WLAN_COUNTRY_INFO_FILE     "wlan/prima/WCNSS_wlan_country_info.dat"
 #define WLAN_HO_CFG_FILE           "wlan/prima/WCNSS_wlan_ho_config"
 #else
@@ -67,5 +96,8 @@ VOS_STATUS hdd_read_cfg_file(v_VOID_t *pCtx, char *pFileName, v_VOID_t *pBuffer,
 
 tVOS_CONCURRENCY_MODE hdd_get_concurrency_mode ( void );
 
+// BEGIN MOTOROLA IKJB42MAIN-274, dpn473, 01/02/2013, Add flag to disable/enable MCC mode
+v_U8_t hdd_get_mcc_mode( void );
+// END IKJB42MAIN-274
 #endif /* WLAN_HDD_MISC_H */
 
