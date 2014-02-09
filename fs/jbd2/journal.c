@@ -1098,7 +1098,7 @@ journal_t * jbd2_journal_init_inode (struct inode *inode)
 	char *p;
 	int err;
 	int n;
-	unsigned long long blocknr;
+	unsigned long long blocknr = 0;
 
 	if (!journal)
 		return NULL;
@@ -1408,6 +1408,14 @@ static int journal_get_superblock(journal_t *journal)
 		journal->j_maxlen = be32_to_cpu(sb->s_maxlen);
 	else if (be32_to_cpu(sb->s_maxlen) > journal->j_maxlen) {
 		printk(KERN_WARNING "JBD2: journal file too short\n");
+		goto out;
+	}
+
+	if (be32_to_cpu(sb->s_first) == 0 ||
+	    be32_to_cpu(sb->s_first) >= journal->j_maxlen) {
+		printk(KERN_WARNING
+			"JBD2: Invalid start block of journal: %u\n",
+			be32_to_cpu(sb->s_first));
 		goto out;
 	}
 

@@ -143,6 +143,60 @@ struct tag_memclk {
 	__u32 fmemclk;
 };
 
+/* Flat device tree address */
+#define ATAG_FLAT_DEV_TREE_ADDRESS 0xf100040A
+struct tag_flat_dev_tree_address {
+	u32 address;
+	u32 size;
+};
+
+/* Motorola Display Panel Type */
+#define ATAG_DISPLAY	0x41000813
+struct tag_display {
+	char display[1];
+};
+
+#ifdef CONFIG_BOOTINFO
+
+/* Powerup Reason */
+#define ATAG_POWERUP_REASON 0xf1000401
+
+struct tag_powerup_reason {
+	uint32_t powerup_reason;
+};
+
+/* MBM version */
+#define ATAG_MBM_VERSION 0xf1000407
+struct tag_mbm_version {
+	uint32_t mbm_version;
+};
+
+/* Battery status at boot */
+#define ATAG_BATTERY_STATUS_AT_BOOT 0xf100040E
+struct tag_battery_status_at_boot {
+	uint16_t battery_status_at_boot;
+	uint16_t padding;
+};
+
+/* CID recover boot */
+#define ATAG_CID_RECOVER_BOOT 0xf1000415
+struct tag_cid_recover_boot {
+	uint32_t cid_recover_boot;
+};
+
+/* Bootloader build signature */
+#define ATAG_BL_BUILD_SIG 0xf1000418
+struct tag_bl_build_sig {
+	char bl_build_sig[1];
+};
+
+#endif /*  CONFIG_BOOTINFO */
+
+#define ATAG_BASEBAND 0x41000812
+struct tag_baseband {
+	char baseband[1];
+};
+
 struct tag {
 	struct tag_header hdr;
 	union {
@@ -165,6 +219,20 @@ struct tag {
 		 * DC21285 specific
 		 */
 		struct tag_memclk	memclk;
+
+		/*
+		 * Motorola specific
+		 */
+		struct tag_flat_dev_tree_address        fdt_addr;
+		struct tag_display	display;
+#ifdef CONFIG_BOOTINFO
+		struct tag_powerup_reason	       powerup_reason;
+		struct tag_mbm_version                 mbm_version;
+		struct tag_battery_status_at_boot      battery_status_at_boot;
+		struct tag_cid_recover_boot            cid_recover_boot;
+		struct tag_bl_build_sig                bl_build_sig;
+#endif /*  CONFIG_BOOTINFO */
+		struct tag_baseband	baseband;
 	} u;
 };
 
@@ -211,7 +279,8 @@ extern struct meminfo meminfo;
 	for (iter = 0; iter < (mi)->nr_banks; iter++)
 
 #define bank_pfn_start(bank)	__phys_to_pfn((bank)->start)
-#define bank_pfn_end(bank)	__phys_to_pfn((bank)->start + (bank)->size)
+#define bank_pfn_end(bank)	(__phys_to_pfn((bank)->start) + \
+						__phys_to_pfn((bank)->size))
 #define bank_pfn_size(bank)	((bank)->size >> PAGE_SHIFT)
 #define bank_phys_start(bank)	(bank)->start
 #define bank_phys_end(bank)	((bank)->start + (bank)->size)
@@ -220,6 +289,18 @@ extern struct meminfo meminfo;
 extern int arm_add_memory(phys_addr_t start, unsigned long size);
 extern void early_print(const char *str, ...);
 extern void dump_machine_table(void);
+
+/*
+ * Early command line parameters.
+ */
+struct early_params {
+	const char *arg;
+	void (*fn)(char **p);
+};
+
+#define __early_param(name,fn)					\
+static struct early_params __early_##fn __used			\
+__attribute__((__section__(".early_param.init"))) = { name, fn }
 
 #endif  /*  __KERNEL__  */
 

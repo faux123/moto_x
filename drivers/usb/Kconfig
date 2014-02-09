@@ -53,6 +53,7 @@ config USB_ARCH_HAS_EHCI
 # some non-PCI HCDs implement xHCI
 config USB_ARCH_HAS_XHCI
 	boolean
+	default y if ARCH_MSM8974
 	default PCI
 
 menuconfig USB_SUPPORT
@@ -132,8 +133,6 @@ source "drivers/usb/wusbcore/Kconfig"
 source "drivers/usb/host/Kconfig"
 
 source "drivers/usb/musb/Kconfig"
-
-source "drivers/usb/renesas_usbhs/Kconfig"
 
 source "drivers/usb/class/Kconfig"
 

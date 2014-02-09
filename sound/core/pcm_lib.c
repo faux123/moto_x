@@ -6,8 +6,7 @@
  *
  *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
- *   the Free Software Foundation; either version 2 of the License, or
- *   (at your option) any later version.
+ *   the Free Software Foundation; only version 2 of the License.
  *
  *   This program is distributed in the hope that it will be useful,
  *   but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -30,6 +29,8 @@
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
 #include <sound/timer.h>
+
+#define STRING_LENGTH_OF_INT 12
 
 /*
  * fill ring buffer with silence
@@ -1030,7 +1031,7 @@ static int snd_interval_ratden(struct snd_interval *i,
  * Returns non-zero if the value is changed, zero if not changed.
  */
 int snd_interval_list(struct snd_interval *i, unsigned int count,
-		      const unsigned int *list, unsigned int mask)
+		      unsigned int *list, unsigned int mask)
 {
         unsigned int k;
 	struct snd_interval list_range;
@@ -1992,6 +1993,9 @@ static int pcm_sanity_check(struct snd_pcm_substream *substream)
 	struct snd_pcm_runtime *runtime;
 	if (PCM_RUNTIME_CHECK(substream))
 		return -ENXIO;
+	/* TODO: consider and -EINVAL here */
+	if (substream->hw_no_buffer)
+		snd_printd("%s: warning this PCM is host less\n", __func__);
 	runtime = substream->runtime;
 	if (snd_BUG_ON(!substream->ops->copy && !runtime->dma_area))
 		return -EINVAL;
@@ -2287,3 +2291,91 @@ snd_pcm_sframes_t snd_pcm_lib_readv(struct snd_pcm_substream *substream,
 }
 
 EXPORT_SYMBOL(snd_pcm_lib_readv);
+
+static int pcm_volume_ctl_info(struct snd_kcontrol *kcontrol,
+				struct snd_ctl_elem_info *uinfo)
+{
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+	uinfo->count = 1;
+	uinfo->value.integer.min = 0;
+	uinfo->value.integer.max = 0x2000;
+	return 0;
+}
+
+static void pcm_volume_ctl_private_free(struct snd_kcontrol *kcontrol)
+{
+	struct snd_pcm_volume *info = snd_kcontrol_chip(kcontrol);
+	info->pcm->streams[info->stream].vol_kctl = NULL;
+	kfree(info);
+}
+
+/**
+ * snd_pcm_add_volume_ctls - create volume control elements
+ * @pcm: the assigned PCM instance
+ * @stream: stream direction
+ * @max_length: the max length of the volume parameter of stream
+ * @private_value: the value passed to each kcontrol's private_value field
+ * @info_ret: store struct snd_pcm_volume instance if non-NULL
+ *
+ * Create volume control elements assigned to the given PCM stream(s).
+ * Returns zero if succeed, or a negative error value.
+ */
+int snd_pcm_add_volume_ctls(struct snd_pcm *pcm, int stream,
+			   const struct snd_pcm_volume_elem *volume,
+			   int max_length,
+			   unsigned long private_value,
+			   struct snd_pcm_volume **info_ret)
+{
+	struct snd_pcm_volume *info;
+	struct snd_kcontrol_new knew = {
+		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+		.access = SNDRV_CTL_ELEM_ACCESS_TLV_READ |
+			SNDRV_CTL_ELEM_ACCESS_READWRITE,
+		.info = pcm_volume_ctl_info,
+	};
+	int err;
+	int size;
+
+	info = kzalloc(sizeof(*info), GFP_KERNEL);
+	if (!info)
+		return -ENOMEM;
+	info->pcm = pcm;
+	info->stream = stream;
+	info->volume = volume;
+	info->max_length = max_length;
+	size = sizeof("Playback ") + sizeof(" Volume") +
+		STRING_LENGTH_OF_INT*sizeof(char) + 1;
+	knew.name = kzalloc(size, GFP_KERNEL);
+	if (!knew.name) {
+		kfree(info);
+		return -ENOMEM;
+	}
+	if (stream == SNDRV_PCM_STREAM_PLAYBACK)
+		snprintf(knew.name, size, "%s %d %s",
+			"Playback", pcm->device, "Volume");
+	else
+		snprintf(knew.name, size, "%s %d %s",
+			"Capture", pcm->device, "Volume");
+	knew.device = pcm->device;
+	knew.count = pcm->streams[stream].substream_count;
+	knew.private_value = private_value;
+	info->kctl = snd_ctl_new1(&knew, info);
+	if (!info->kctl) {
+		kfree(info);
+		kfree(knew.name);
+		return -ENOMEM;
+	}
+	info->kctl->private_free = pcm_volume_ctl_private_free;
+	err = snd_ctl_add(pcm->card, info->kctl);
+	if (err < 0) {
+		kfree(info);
+		kfree(knew.name);
+		return -ENOMEM;
+	}
+	pcm->streams[stream].vol_kctl = info->kctl;
+	if (info_ret)
+		*info_ret = info;
+	kfree(knew.name);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(snd_pcm_add_volume_ctls);

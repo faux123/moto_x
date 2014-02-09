@@ -2162,7 +2162,7 @@ static inline void flush_unauthorized_files(const struct cred *cred,
 		int fd;
 
 		j++;
-		i = j * BITS_PER_LONG;
+		i = j * __NFDBITS;
 		fdt = files_fdtable(files);
 		if (i >= fdt->max_fds)
 			break;
@@ -3754,6 +3754,11 @@ static int sock_has_perm(struct task_struct *task, struct sock *sk, u32 perms)
 	struct selinux_audit_data sad = {0,};
 	struct lsm_network_audit net = {0,};
 	u32 tsid = task_sid(task);
+
+	if (unlikely(!sksec)) {
+		pr_crit("SELinux: sksec is NULL, socket is already freed.\n");
+		return -EINVAL;
+	}
 
 	if (sksec->sid == SECINITSID_KERNEL)
 		return 0;

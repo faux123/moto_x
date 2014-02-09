@@ -440,6 +440,9 @@ struct radeon_connector {
 	struct radeon_i2c_chan *ddc_bus;
 	/* some systems have an hdmi and vga port with a shared ddc line */
 	bool shared_ddc;
+	/* for some Radeon chip families we apply an additional EDID header
+	   check as part of the DDC probe */
+	bool requires_extended_probe;
 	bool use_digital;
 	/* we need to mind the EDID between detect
 	   and get modes due to analog/digital/tvencoder */

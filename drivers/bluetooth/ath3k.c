@@ -30,7 +30,6 @@
 #include <net/bluetooth/bluetooth.h>
 
 #define VERSION "1.0"
-#define ATH3K_FIRMWARE	"ath3k-1.fw"
 
 #define ATH3K_DNLOAD				0x01
 #define ATH3K_GETSTATE				0x05
@@ -122,7 +121,7 @@ static int ath3k_load_firmware(struct usb_device *udev,
 
 	pipe = usb_sndctrlpipe(udev, 0);
 
-	send_buf = kmalloc(BULK_SIZE, GFP_KERNEL);
+	send_buf = kmalloc(BULK_SIZE, GFP_ATOMIC);
 	if (!send_buf) {
 		BT_ERR("Can't allocate memory chunk for firmware");
 		return -ENOMEM;
@@ -193,7 +192,7 @@ static int ath3k_load_fwfile(struct usb_device *udev,
 
 	count = firmware->size;
 
-	send_buf = kmalloc(BULK_SIZE, GFP_KERNEL);
+	send_buf = kmalloc(BULK_SIZE, GFP_ATOMIC);
 	if (!send_buf) {
 		BT_ERR("Can't allocate memory chunk for firmware");
 		return -ENOMEM;
@@ -417,15 +416,9 @@ static int ath3k_probe(struct usb_interface *intf,
 		return 0;
 	}
 
-	ret = request_firmware(&firmware, ATH3K_FIRMWARE, &udev->dev);
-	if (ret < 0) {
-		if (ret == -ENOENT)
-			BT_ERR("Firmware file \"%s\" not found",
-							ATH3K_FIRMWARE);
-		else
-			BT_ERR("Firmware file \"%s\" request failed (err=%d)",
-							ATH3K_FIRMWARE, ret);
-		return ret;
+	if (request_firmware(&firmware, "ath3k-1.fw", &udev->dev) < 0) {
+		BT_ERR("Error loading firmware");
+		return -EIO;
 	}
 
 	ret = ath3k_load_firmware(udev, firmware);
@@ -446,10 +439,22 @@ static struct usb_driver ath3k_driver = {
 	.id_table	= ath3k_table,
 };
 
-module_usb_driver(ath3k_driver);
+static int __init ath3k_init(void)
+{
+	BT_INFO("Atheros AR30xx firmware driver ver %s", VERSION);
+	return usb_register(&ath3k_driver);
+}
+
+static void __exit ath3k_exit(void)
+{
+	usb_deregister(&ath3k_driver);
+}
+
+module_init(ath3k_init);
+module_exit(ath3k_exit);
 
 MODULE_AUTHOR("Atheros Communications");
 MODULE_DESCRIPTION("Atheros AR30xx firmware driver");
 MODULE_VERSION(VERSION);
 MODULE_LICENSE("GPL");
-MODULE_FIRMWARE(ATH3K_FIRMWARE);
+MODULE_FIRMWARE("ath3k-1.fw");

@@ -55,6 +55,9 @@
 #include <asm/traps.h>
 #include <asm/unwind.h>
 #include <asm/memblock.h>
+#ifdef CONFIG_BOOTINFO
+#include <asm/bootinfo.h>
+#endif
 
 #if defined(CONFIG_DEPRECATED_PARAM_STRUCT)
 #include "compat.h"
@@ -81,6 +84,9 @@ __setup("fpe=", fpe_setup);
 extern void paging_init(struct machine_desc *desc);
 extern void sanity_check_meminfo(void);
 extern void reboot_setup(char *str);
+extern void setup_dma_zone(struct machine_desc *desc);
+void __attribute__((weak)) mach_cpuinfo_show(struct seq_file *m, void *v);
+
 
 unsigned int processor_id;
 EXPORT_SYMBOL(processor_id);
@@ -103,6 +109,8 @@ EXPORT_SYMBOL(system_serial_high);
 unsigned int elf_hwcap __read_mostly;
 EXPORT_SYMBOL(elf_hwcap);
 
+unsigned int boot_reason;
+EXPORT_SYMBOL(boot_reason);
 
 #ifdef MULTI_CPU
 struct processor processor __read_mostly;
@@ -742,6 +750,64 @@ static int __init parse_tag_cmdline(const struct tag *tag)
 
 __tagtable(ATAG_CMDLINE, parse_tag_cmdline);
 
+#ifdef CONFIG_BOOTINFO
+
+static int __init parse_tag_powerup_reason(const struct tag *tag)
+{
+	bi_set_powerup_reason(tag->u.powerup_reason.powerup_reason);
+	printk(KERN_WARNING "%s: powerup reason=0x%08x\n",
+				__func__, bi_powerup_reason());
+	return 0;
+}
+
+__tagtable(ATAG_POWERUP_REASON, parse_tag_powerup_reason);
+
+static int __init parse_tag_mbm_version(const struct tag *tag)
+{
+	bi_set_mbm_version(tag->u.mbm_version.mbm_version);
+	printk(KERN_INFO "%s: mbm_version=0x%08x\n",
+				__func__, bi_mbm_version());
+	return 0;
+}
+
+__tagtable(ATAG_MBM_VERSION, parse_tag_mbm_version);
+
+static int __init parse_tag_battery_status_at_boot(const struct tag *tag)
+{
+	bi_set_battery_status_at_boot(tag->
+			u.battery_status_at_boot.battery_status_at_boot);
+	printk(KERN_INFO "%s: battery_status_at_boot=0x%08x\n",
+				__func__, bi_battery_status_at_boot());
+	return 0;
+}
+
+__tagtable(ATAG_BATTERY_STATUS_AT_BOOT, parse_tag_battery_status_at_boot);
+
+static int __init parse_tag_cid_recover_boot(const struct tag *tag)
+{
+	bi_set_cid_recover_boot(tag->u.cid_recover_boot.cid_recover_boot);
+	printk(KERN_INFO "%s: cid_recover_boot=\"%d\"\n",
+				__func__, bi_cid_recover_boot());
+	return 0;
+}
+
+__tagtable(ATAG_CID_RECOVER_BOOT, parse_tag_cid_recover_boot);
+
+static int __init parse_tag_bl_build_sig(const struct tag *tag)
+{
+	char *s = (char *)tag->u.bl_build_sig.bl_build_sig;
+
+	printk(KERN_WARNING "%s: %s\n",	__func__, s);
+
+	bi_add_bl_build_sig(s);
+
+	return 0;
+}
+
+__tagtable(ATAG_BL_BUILD_SIG, parse_tag_bl_build_sig);
+
+#endif /* CONFIG_BOOTINFO */
+
 /*
  * Scan the tag table for this tag, and call its parse function.
  * The tag table is built by the linker from all the __tagtable
@@ -939,12 +1005,8 @@ void __init setup_arch(char **cmdline_p)
 	machine_desc = mdesc;
 	machine_name = mdesc->name;
 
-#ifdef CONFIG_ZONE_DMA
-	if (mdesc->dma_zone_size) {
-		extern unsigned long arm_dma_zone_size;
-		arm_dma_zone_size = mdesc->dma_zone_size;
-	}
-#endif
+	setup_dma_zone(mdesc);
+
 	if (mdesc->restart_mode)
 		reboot_setup(&mdesc->restart_mode);
 
@@ -958,6 +1020,9 @@ void __init setup_arch(char **cmdline_p)
 	*cmdline_p = cmd_line;
 
 	parse_early_param();
+
+	if (mdesc->init_very_early)
+		mdesc->init_very_early();
 
 	sort(&meminfo.bank, meminfo.nr_banks, sizeof(meminfo.bank[0]), meminfo_cmp, NULL);
 	sanity_check_meminfo();
@@ -1054,7 +1119,7 @@ static int c_show(struct seq_file *m, void *v)
 		   cpu_name, read_cpuid_id() & 15, elf_platform);
 
 #if defined(CONFIG_SMP)
-	for_each_online_cpu(i) {
+	for_each_present_cpu(i) {
 		/*
 		 * glibc reads /proc/cpuinfo to determine the number of
 		 * online processors, looking for lines beginning with
@@ -1105,6 +1170,9 @@ static int c_show(struct seq_file *m, void *v)
 	seq_printf(m, "Revision\t: %04x\n", system_rev);
 	seq_printf(m, "Serial\t\t: %08x%08x\n",
 		   system_serial_high, system_serial_low);
+
+	if (mach_cpuinfo_show)
+		mach_cpuinfo_show(m, v);
 
 	return 0;
 }
