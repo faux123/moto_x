@@ -26,6 +26,7 @@ modules.builtin
 *.elf
 *.bin
 *.gz
+*.zip
 *.bz2
 *.lzma
 *.xz
@@ -84,3 +85,6 @@ GTAGS
 *.orig
 *~
 \#*#
+
+#user ignores
+out/boot.img
