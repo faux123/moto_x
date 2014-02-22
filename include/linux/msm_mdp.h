@@ -79,12 +79,17 @@
 #define MSMFB_REG_READ   _IOWR(MSMFB_IOCTL_MAGIC, 64, struct msmfb_reg_access)
 #define MSMFB_REG_WRITE  _IOW(MSMFB_IOCTL_MAGIC, 65, struct msmfb_reg_access)
 
-#define MSMFB_HIDE_IMG				_IOW(MSMFB_IOCTL_MAGIC, 170, \
-						int)
+#define MSMFB_HIDE_IMG			_IOW(MSMFB_IOCTL_MAGIC, 170, int)
 #define MSMFB_PREPARE_FOR_SUSPEND	_IOW(MSMFB_IOCTL_MAGIC, 171, \
-						struct msmfb_suspend_cfg)
+					struct msmfb_suspend_cfg)
 #define MSMFB_PREPARE_FOR_RESUME	_IOW(MSMFB_IOCTL_MAGIC, 172, \
-						struct msmfb_resume_cfg)
+					struct msmfb_resume_cfg)
+#define MSMFB_QUICKDRAW_INIT		_IO(MSMFB_IOCTL_MAGIC, 173)
+#define MSMFB_QUICKDRAW_ADD_BUFFER	_IOW(MSMFB_IOCTL_MAGIC, 174, \
+					struct msmfb_quickdraw_buffer_data)
+#define MSMFB_QUICKDRAW_REMOVE_BUFFER	_IOW(MSMFB_IOCTL_MAGIC, 175, int)
+#define MSMFB_QUICKDRAW_LOCK_BUFFER	_IOW(MSMFB_IOCTL_MAGIC, 176, int)
+#define MSMFB_QUICKDRAW_UNLOCK_BUFFER	_IOW(MSMFB_IOCTL_MAGIC, 177, int)
 
 #define FB_TYPE_3D_PANEL 0x10101010
 #define MDP_IMGTYPE2_START 0x10000
@@ -103,6 +108,7 @@ enum {
 	MDP_ARGB_8888,    /* ARGB 888 */
 	MDP_RGB_888,      /* RGB 888 planer */
 	MDP_Y_CRCB_H2V2,  /* Y and CrCb, pseudo planer w/ Cr is in MSB */
+	MDP_YCBYCR_H2V1,  /* YCbYCr interleave */
 	MDP_YCRYCB_H2V1,  /* YCrYCb interleave */
 	MDP_Y_CRCB_H2V1,  /* Y and CrCb, pseduo planer w/ Cr is in MSB */
 	MDP_Y_CBCR_H2V1,   /* Y and CrCb, pseduo planer w/ Cr is in MSB */
@@ -421,6 +427,15 @@ struct mdp_histogram {
 	uint32_t *b;
 };
 
+struct msmfb_quickdraw_buffer_data {
+	int buffer_id;
+	int user_fd;
+	int format;
+	int x;
+	int y;
+	int w;
+	int h;
+};
 
 /*
 

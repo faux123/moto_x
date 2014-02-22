@@ -108,6 +108,7 @@ struct mmi_disp_data {
 	struct mmi_disp_gpio_config mipi_mux_select;
 	struct mmi_disp_reg_lst reg_lst;
 	bool partial_mode_supported;
+	bool quickdraw_enabled;
 	bool prevent_pwr_off;
 	uint32_t dsi_freq[RADIO_ID_MAX];
 };
@@ -117,6 +118,11 @@ static struct mmi_disp_data mmi_disp_info;
 static bool is_partial_mode_supported(void)
 {
 	return mmi_disp_info.partial_mode_supported;
+}
+
+static bool is_quickdraw_enabled(void)
+{
+	return mmi_disp_info.quickdraw_enabled;
 }
 
 static struct mmi_disp_reg_lst dsi_regs_lst = {
@@ -516,6 +522,8 @@ static void __init mmi_load_panel_from_dt(void)
 		"mipi_d0_sel", 1);
 	mmi_disp_info.partial_mode_supported =
 		ZERO_IF_NEG(load_disp_value(node, "partial_mode_supported"));
+	mmi_disp_info.quickdraw_enabled =
+		ZERO_IF_NEG(load_disp_value(node, "quickdraw_enabled"));
 	pr_debug("%s: partial_mode_supported %d\n", __func__,
 		mmi_disp_info.partial_mode_supported);
 
@@ -661,6 +669,7 @@ static int panel_reset_enable(int enable)
 	struct mmi_disp_gpio_config *en;
 	static bool reset_init;
 	static bool first_boot = true;
+	static int save_enable = -1;
 
 	pr_debug("%s(%d) is called\n", __func__, enable);
 	if (!reset_init) {
@@ -675,6 +684,10 @@ static int panel_reset_enable(int enable)
 
 		reset_init = true;
 	}
+
+	if (save_enable == enable)
+		goto end;
+	save_enable = enable;
 
 	for (i = 0; i < mmi_disp_info.num_disp_reset; i++) {
 		en = &mmi_disp_info.disp_gpio[i];
@@ -1144,6 +1157,7 @@ void __init mmi_display_init(struct msm_fb_platform_data *msm_fb_pdata,
 	mmi_load_panel_from_dt();
 	no_disp = no_disp_detection();
 	msm_fb_pdata->is_partial_mode_supported = is_partial_mode_supported;
+	msm_fb_pdata->is_quickdraw_enabled = is_quickdraw_enabled;
 	msm_fb_pdata->detect_client = msm_fb_detect_panel;
 	mipi_dsi_pdata->vsync_gpio = 0;
 	mipi_dsi_pdata->dsi_power_save = mipi_dsi_power;

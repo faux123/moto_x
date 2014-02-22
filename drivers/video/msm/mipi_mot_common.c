@@ -54,12 +54,6 @@ static struct dsi_cmd_desc mot_display_off_cmd = {
 static struct dsi_cmd_desc mot_get_pwr_mode_cmd = {
 	DTYPE_DCS_READ,  1, 0, 1, 0, sizeof(get_power_mode), get_power_mode};
 
-static struct dsi_cmd_desc mot_hide_img_cmd = {
-	DTYPE_DCS_WRITE, 1, 0, 0, 10, sizeof(display_off), display_off};
-
-static struct dsi_cmd_desc mot_unhide_img_cmd = {
-	DTYPE_DCS_WRITE, 1, 0, 0, 10, sizeof(display_on), display_on};
-
 static struct dsi_cmd_desc mot_get_raw_mtp_cmd = {
 	DTYPE_DCS_READ,  1, 0, 1, 0, sizeof(get_raw_mtp), get_raw_mtp};
 
@@ -142,45 +136,37 @@ int mipi_mot_panel_on(struct msm_fb_data_type *mfd)
 	int ret = 0;
 	u8 attempts = 1;
 	u8 failures = 0;
-	int keep_hidden = mfd->resume_cfg.keep_hidden;
-	mfd->resume_cfg.keep_hidden = 0;
 
-	if (keep_hidden) {
-		pr_info("%s: skipping display on\n", __func__);
-		mot_panel->esd_expected_pwr_mode = 0x90;
-	} else {
-		mipi_mot_exit_sleep_wait();
+	mipi_mot_exit_sleep_wait();
 
-		mmi_panel_notify(MMI_PANEL_EVENT_POST_INIT, NULL);
-		pr_info("%s: sending display on\n", __func__);
-		do {
-			mipi_mot_tx_cmds(&mot_display_on_cmds[0],
-				ARRAY_SIZE(mot_display_on_cmds));
-			mot_panel->esd_expected_pwr_mode = 0x94;
+	mmi_panel_notify(MMI_PANEL_EVENT_POST_INIT, NULL);
+	pr_info("%s: sending display on\n", __func__);
+	do {
+		mipi_mot_tx_cmds(&mot_display_on_cmds[0],
+			ARRAY_SIZE(mot_display_on_cmds));
+		mot_panel->esd_expected_pwr_mode = 0x94;
 
-			ret = mipi_mot_get_pwr_mode(mfd, &pwr_mode);
-			if (ret > 0) {
-				pr_info("%s: Power_mode =0x%x\n", __func__,
-					pwr_mode);
-				/* validate screen is actually on */
-				if ((pwr_mode & 0x04) != 0x04) {
-					pr_err("%s: display on fail! [0x%x]\n",
-						__func__, pwr_mode);
-					ret = -1;
-					failures = attempts;
-				}
-			} else
-				pr_err("%s: Failed to get power_mode. [%d]\n",
-					__func__, ret);
-		} while (ret <= 0 && attempts++ < 5);
+		ret = mipi_mot_get_pwr_mode(mfd, &pwr_mode);
+		if (ret > 0) {
+			pr_info("%s: Power_mode =0x%x\n", __func__,
+				pwr_mode);
+			/* validate screen is actually on */
+			if ((pwr_mode & 0x04) != 0x04) {
+				pr_err("%s: display on fail! [0x%x]\n",
+					__func__, pwr_mode);
+				ret = -1;
+				failures = attempts;
+			}
+		} else
+			pr_err("%s: Failed to get power_mode. [%d]\n",
+				__func__, ret);
+	} while (ret <= 0 && attempts++ < 5);
 
-		if (failures > 0) {
-			pr_err("%s: Display failure: DISON (0x04) bit not set"
-				" | fail count: %d, display %s\n",
-				__func__, failures,
-				(ret > 0) ? "recovered" : "did not recover");
-			dropbox_queue_event_empty("display_issue");
-		}
+	if (failures > 0) {
+		pr_err("%s: Display failure: DISON (0x04) bit not set | fail count: %d, display %s\n",
+			__func__, failures,
+			(ret > 0) ? "recovered" : "did not recover");
+		dropbox_queue_event_empty("display_issue");
 	}
 
 	return 0;
@@ -519,8 +505,6 @@ static int esd_recovery_start(struct msm_fb_data_type *mfd)
 		mot_panel->panel_enable(mfd);
 	atomic_set(&mot_panel->state, MOT_PANEL_ON);
 	mdp4_dsi_cmd_pipe_commit(0, 1);
-	mfd->resume_cfg.keep_hidden =
-			!(mot_panel->esd_expected_pwr_mode & 0x04);
 	mipi_mot_panel_on(mfd);
 	ret = MOT_ESD_OK;
 end:
@@ -602,28 +586,6 @@ void mipi_mot_esd_work(void)
 end:
 	return;
 }
-
-int mipi_mot_hide_img(struct msm_fb_data_type *mfd, int hide)
-{
-	int ret = 0;
-	pr_info("%s(%d)\n", __func__, hide);
-	if ((mfd->op_enable != 0) && (mfd->panel_power_on != 0)) {
-		mmi_panel_notify(MMI_PANEL_EVENT_HIDE_IMAGE, NULL);
-		mutex_lock(&mfd->dma->ov_mutex);
-		mipi_set_tx_power_mode(0);
-		if (mipi_mot_tx_cmds(
-			hide ? &mot_hide_img_cmd : &mot_unhide_img_cmd, 1) == 1)
-			mot_panel->esd_expected_pwr_mode = hide ? 0x90 : 0x94;
-		else {
-			pr_err("%s(%d) error sending mipi cmd\n",
-				__func__, hide);
-			ret = -1;
-		}
-		mutex_unlock(&mfd->dma->ov_mutex);
-	}
-	return ret;
-}
-
 
 void mipi_mot_set_tear(struct msm_fb_data_type *mfd, int on)
 {
@@ -733,4 +695,95 @@ int is_aod_supported(struct msm_fb_data_type *mfd)
 {
 	return mfd && mfd->is_partial_mode_supported &&
 		mfd->is_partial_mode_supported();
+}
+
+int correct_shift_for_aod(struct msm_fb_data_type *mfd, int x2, int y2)
+{
+	/* Workaround window size is a product of testing and verification */
+	struct mipi_mot_panel *mot_panel = mipi_mot_get_mot_panel();
+	struct msm_panel_info *pinfo = &mot_panel->pinfo;
+	int x1 = x2 - 7;
+	int y1 = y2 - 1;
+	char col[] = {0x2a, 0x00, 0x00, 0x00, 0x00};
+	char row[] = {0x2b, 0x00, 0x00, 0x00, 0x00};
+	char frame[] = {
+		0x2c,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00
+	};
+	struct mipi_mot_cmd_seq correct_shift_seq[] = {
+		MIPI_MOT_TX_DEF(NULL, DTYPE_DCS_LWRITE, 0, col),
+		MIPI_MOT_TX_DEF(NULL, DTYPE_DCS_LWRITE, 0, row),
+		MIPI_MOT_TX_DEF(NULL, DTYPE_DCS_LWRITE, 0, frame),
+	};
+
+	if (x1 < 0 || y1 < 0 || x2 >= pinfo->xres || y2 >= pinfo->yres) {
+		pr_warn("%s: Invalid x,y coordinates (%d, %d)\n",
+			__func__, x2, y2);
+		return -EINVAL;
+	}
+
+	col[1] = x1 >> 8;
+	col[2] = x1 & 0xFF;
+	col[3] = x2 >> 8;
+	col[4] = x2 & 0xFF;
+	row[1] = y1 >> 8;
+	row[2] = y1 & 0xFF;
+	row[3] = y2 >> 8;
+	row[4] = y2 & 0xFF;
+
+	pr_debug("%s: cmd 2ah[h:0x%X l:0x%X -> h:0x%X l:0x%X]\n", __func__,
+		col[1], col[2], col[3], col[4]);
+	pr_debug("%s: cmd 2bh[h:0x%X l:0x%X -> h:0x%X l:0x%X]\n", __func__,
+		row[1], row[2], row[3], row[4]);
+
+	return mipi_mot_exec_cmd_seq(mfd, correct_shift_seq,
+		ARRAY_SIZE(correct_shift_seq));
+}
+
+int mipi_mot_set_partial_window(struct msm_fb_data_type *mfd,
+	int x, int y, int w, int h)
+{
+	struct mipi_mot_panel *mot_panel = mipi_mot_get_mot_panel();
+	struct msm_panel_info *pinfo;
+	char col[] = {0x2a, 0x00, 0x00, 0x00, 0x00};
+	char row[] = {0x2b, 0x00, 0x00, 0x00, 0x00};
+	struct mipi_mot_cmd_seq partial_window_seq[] = {
+		MIPI_MOT_TX_DEF(NULL, DTYPE_DCS_LWRITE, 0, col),
+		MIPI_MOT_TX_DEF(NULL, DTYPE_DCS_LWRITE, 0, row),
+	};
+
+	pr_debug("%s: (%d, %d, %d, %d)\n", __func__, x, y, w, h);
+
+	pinfo = &mot_panel->pinfo;
+	if (x < 0 ||
+	    (x + w) > pinfo->xres ||
+	    y < 0 ||
+	    (y + h) > pinfo->yres) {
+		pr_err("%s: Invalid parameters!\n", __func__);
+		return -EINVAL;
+	}
+
+	if (mot_panel->is_correct_shift_for_aod_needed &&
+		mot_panel->is_correct_shift_for_aod_needed(mfd))
+		correct_shift_for_aod(mfd, x + w - 1, y + h - 1);
+
+	col[1] = x >> 8;
+	col[2] = x & 0xFF;
+	col[3] = (x + w - 1) >> 8;
+	col[4] = (x + w - 1) & 0xFF;
+	row[1] = y >> 8;
+	row[2] = y & 0xFF;
+	row[3] = (y + h - 1) >> 8;
+	row[4] = (y + h - 1) & 0xFF;
+	pr_debug("%s: cmd 2ah[h:0x%X l:0x%X -> h:0x%X l:0x%X]\n", __func__,
+		col[1], col[2], col[3], col[4]);
+	pr_debug("%s: cmd 2bh[h:0x%X l:0x%X -> h:0x%X l:0x%X]\n", __func__,
+		row[1], row[2], row[3], row[4]);
+
+	return mipi_mot_exec_cmd_seq(mfd, partial_window_seq,
+		ARRAY_SIZE(partial_window_seq));
 }

@@ -115,6 +115,10 @@
 		_IOR(MSP430_IOCTL_BASE, 46, char*)
 #define MSP430_IOCTL_READ_REG \
 		_IOR(MSP430_IOCTL_BASE, 47, char*)
+#define MSP430_IOCTL_SET_STEP_COUNTER_DELAY \
+		_IOW(MSP430_IOCTL_BASE, 48,  unsigned short)
+#define MSP430_IOCTL_ENABLE_BREATHING \
+		_IOW(MSP430_IOCTL_BASE, 49, unsigned char)
 
 #define FW_VERSION_SIZE 12
 #define MSP_CONTROL_REG_SIZE 200
@@ -164,10 +168,14 @@ struct msp430_platform_data {
 #define M_DISP_ROTATE		0x0800
 #define M_DISP_BRIGHTNESS	0x1000
 
+#define M_STEP_DETECTOR		0x2000
+#define M_STEP_COUNTER		0x4000
+
 /* wake sensor status */
 #define M_DOCK			0x0001
 #define M_PROXIMITY		0x0002
 #define M_TOUCH			0x0004
+#define M_QUICKPEEK		0x0010
 #define M_HUB_RESET		0x0080
 
 #define M_FLATUP		0x0100
@@ -250,7 +258,9 @@ enum MSP430_data_types {
 	DT_ACCUM_MVMT,
 	DT_SIM,
 	DT_RESET,
-	DT_GENERIC_INT
+	DT_GENERIC_INT,
+	DT_STEP_COUNTER,
+	DT_STEP_DETECTOR
 };
 
 enum {
@@ -258,6 +268,23 @@ enum {
 	DESK_DOCK,
 	CAR_DOCK
 };
+
+#ifdef __KERNEL__
+
+#define QUICKDRAW_ESD_RECOVERED -1337
+
+struct msp430_quickdraw_ops {
+	int (*prepare)(void *data, unsigned char panel_state);
+	int (*execute)(void *data, int buffer_id, int x, int y);
+	int (*erase)(void *data, int x1, int y1, int x2, int y2);
+	int (*cleanup)(void *data);
+	void *data; /* arbitrary data passed back to user */
+};
+
+void msp430_register_quickdraw(struct msp430_quickdraw_ops *handler);
+void msp430_unregister_quickdraw(struct msp430_quickdraw_ops *handler);
+
+#endif
 
 #endif  /* __MSP430_H__ */
 

@@ -36,6 +36,7 @@
 #include <linux/module.h>
 #include <linux/msp430.h>
 #include <linux/poll.h>
+#include <linux/quickwakeup.h>
 #include <linux/regulator/consumer.h>
 #include <linux/slab.h>
 #include <linux/switch.h>
@@ -78,6 +79,8 @@
 #define REV_ID				0x01
 #define ERROR_STATUS			0x02
 
+#define MSP_PEEKDATA_REG		0x09
+#define MSP_PEEKSTATUS_REG		0x0A
 #define MSP_STATUS_REG			0x0B
 #define MSP_TOUCH_REG			0x0C
 #define MSP_CONTROL_REG			0x0D
@@ -109,6 +112,8 @@
 #define LUX_TABLE_VALUES                0x34
 #define BRIGHTNESS_TABLE_VALUES         0x35
 
+#define STEP_COUNTER_UPDATE_RATE        0x36
+
 #define INTERRUPT_MASK			0x37
 #define WAKESENSOR_STATUS		0x39
 #define INTERRUPT_STATUS		0x3A
@@ -117,11 +122,15 @@
 #define LIN_ACCEL_X			0x3C
 #define GRAVITY_X			0x3D
 
+#define STEP_COUNTER			0X3E
+
 #define DOCK_DATA			0x3F
 
 #define TEMPERATURE_DATA		0x41
 
 #define GYRO_X				0x43
+
+#define STEP_DETECTOR			0X47
 
 #define MAG_CAL				0x48
 #define MAG_HX				0x49
@@ -172,11 +181,30 @@
 
 #define ESR_SIZE	32
 
+#define MSP_BUSY_STATUS_MASK	0x80
 #define MSP_BUSY_SLEEP_USEC	10000
 #define MSP_BUSY_RESUME_COUNT	14
 #define MSP_BUSY_SUSPEND_COUNT	6
 
 #define AOD_WAKEUP_REASON_ESD		4
+#define AOD_WAKEUP_REASON_QP_PREPARE		5
+#define AOD_WAKEUP_REASON_QP_DRAW		6
+#define AOD_WAKEUP_REASON_QP_ERASE		7
+#define AOD_WAKEUP_REASON_QP_COMPLETE		8
+
+#define AOD_QP_ACK_BUFFER_ID_MASK	0x3F
+#define AOD_QP_ACK_SUCCESS		0
+#define AOD_QP_ACK_BAD_MSG_ORDER	1
+#define AOD_QP_ACK_INVALID		2
+#define AOD_QP_ACK_ESD_RECOVERED	3
+
+#define AOD_QP_DRAW_MAX_BUFFER_ID	63
+#define AOD_QP_DRAW_NO_OVERRIDE		0xFFFF
+#define AOD_QP_TIMEOUT			2*HZ
+
+#define AOD_QP_ENABLED_VOTE_KERN		0x01
+#define AOD_QP_ENABLED_VOTE_USER		0x02
+#define AOD_QP_ENABLED_VOTE_MASK		0x03
 
 #define MSP_MAX_GENERIC_DATA		512
 
@@ -191,6 +219,7 @@ static unsigned short g_acc_delay;
 static unsigned short g_mag_delay;
 static unsigned short g_gyro_delay;
 static unsigned short g_baro_delay;
+static unsigned short g_step_counter_delay;
 static unsigned short g_nonwake_sensor_state;
 static unsigned short g_wake_sensor_state;
 static unsigned short g_algo_state;
@@ -198,6 +227,7 @@ static unsigned char g_motion_dur;
 static unsigned char g_zmotion_dur;
 static unsigned char g_control_reg[MSP_CONTROL_REG_SIZE];
 static unsigned char g_mag_cal[MSP_MAG_CAL_SIZE];
+static unsigned short g_control_reg_restore;
 
 /* Store error message */
 unsigned char stat_string[ESR_SIZE+1];
@@ -221,6 +251,29 @@ enum msp_mode {
 	BOOTMODE,
 	NORMALMODE,
 	FACTORYMODE
+};
+
+enum msp_quickpeek_state {
+	QP_IDLE,
+	QP_AWAKE,
+	QP_PREPARED
+};
+
+struct msp430_quickpeek_message {
+	u8 message;
+	u8 panel_state;
+	u8 buffer_id;
+	u16 x1;
+	u16 y1;
+	u16 x2;
+	u16 y2;
+	struct list_head list;
+};
+
+struct msp430_aod_enabled_vote {
+	struct mutex vote_lock;
+	unsigned int vote;
+	unsigned int resolved_vote;
 };
 
 struct msp430_data {
@@ -263,11 +316,21 @@ struct msp430_data {
 	int msp430_ms_data_buffer_head;
 	int msp430_ms_data_buffer_tail;
 	wait_queue_head_t msp430_ms_data_wq;
-	bool ap_msp_handoff_ctrl;
-	bool ap_msp_handoff_enable;
+	bool ap_msp_handoff_gpio_ctrl;
 
 	struct regulator *vio_regulator;
 	struct regulator *vcc_regulator;
+
+	/* Quick peek data */
+	enum msp_quickpeek_state quickpeek_state;
+	struct workqueue_struct *quickpeek_work_queue;
+	struct work_struct quickpeek_work;
+	struct wake_lock quickpeek_wakelock;
+	struct completion quickpeek_done;
+	struct list_head quickpeek_command_list;
+	atomic_t qp_enabled;
+	unsigned short qw_irq_status;
+	struct msp430_aod_enabled_vote aod_enabled;
 };
 
 enum msp_commands {
@@ -368,6 +431,16 @@ static const unsigned short crc_table[256] = {
 };
 
 struct msp430_data *msp430_misc_data;
+
+static int msp430_ms_data_buffer_write(struct msp430_data *ps_msp430,
+	unsigned char type, signed short data1, signed short data2,
+	signed short data3, signed short data4);
+static struct quickwakeup_ops msp430_quickwakeup_ops;
+static struct msp430_quickdraw_ops *msp430_quickdraw_ops;
+static void msp430_quickpeek_reset_locked(struct msp430_data *ps_msp430);
+static void msp430_vote_aod_enabled(struct msp430_data *ps_msp430, int voter,
+				    bool enable);
+static int msp430_resolve_aod_enabled_locked(struct msp430_data *ps_msp430);
 
 #ifdef CONFIG_HAS_EARLYSUSPEND
 static void msp430_early_suspend(struct early_suspend *handler);
@@ -582,13 +655,14 @@ static int msp430_reset_and_init(void)
 	unsigned int i;
 	int err, ret_err = 0;
 	unsigned char *rst_cmdbuff = kmalloc(512, GFP_KERNEL);
+	int mutex_locked = 0;
 
 	if (rst_cmdbuff == NULL)
 		return -1;
 
 	pdata = msp430_misc_data->pdata;
 
-	if (msp430_misc_data->ap_msp_handoff_ctrl) {
+	if (msp430_misc_data->ap_msp_handoff_gpio_ctrl) {
 		msp_req_gpio = pdata->gpio_mipi_req;
 		msp_req_value = gpio_get_value(msp_req_gpio);
 		if (msp_req_value)
@@ -623,6 +697,13 @@ static int msp430_reset_and_init(void)
 	rst_cmdbuff[0] = PRESSURE_UPDATE_RATE;
 	rst_cmdbuff[1] = g_baro_delay;
 	err = msp430_i2c_write_no_reset(msp430_misc_data, rst_cmdbuff, 2);
+	if (err < 0)
+		ret_err = err;
+
+	rst_cmdbuff[0] = STEP_COUNTER_UPDATE_RATE;
+	rst_cmdbuff[1] = (g_step_counter_delay>>8);
+	rst_cmdbuff[2] = g_step_counter_delay;
+	err = msp430_i2c_write_no_reset(msp430_misc_data, rst_cmdbuff, 3);
 	if (err < 0)
 		ret_err = err;
 
@@ -665,12 +746,16 @@ static int msp430_reset_and_init(void)
 
 	if (msp_req_value)
 	{
-		rst_cmdbuff[0] = MSP_CONTROL_REG;
-		memcpy(&rst_cmdbuff[1], g_control_reg, MSP_CONTROL_REG_SIZE);
-		err = msp430_i2c_write_no_reset(msp430_misc_data, rst_cmdbuff,
-			MSP_CONTROL_REG_SIZE);
-		if (err < 0)
-			ret_err = err;
+		if (g_control_reg_restore) {
+			rst_cmdbuff[0] = MSP_CONTROL_REG;
+			memcpy(&rst_cmdbuff[1], g_control_reg,
+				MSP_CONTROL_REG_SIZE);
+			err = msp430_i2c_write_no_reset(msp430_misc_data,
+				rst_cmdbuff,
+				MSP_CONTROL_REG_SIZE);
+			if (err < 0)
+				ret_err = err;
+		}
 
 		gpio_set_value(msp_req_gpio, 1);
 	}
@@ -733,6 +818,15 @@ static int msp430_reset_and_init(void)
 	msp430_i2c_write_read_no_reset(msp430_misc_data, rst_cmdbuff, 1, 2);
 
 	kfree(rst_cmdbuff);
+
+	/* sending reset to slpc hal */
+	msp430_ms_data_buffer_write(msp430_misc_data, DT_RESET,
+		0, 0, 0, 0);
+
+	mutex_locked = mutex_trylock(&msp430_misc_data->lock);
+	msp430_quickpeek_reset_locked(msp430_misc_data);
+	if (mutex_locked)
+		mutex_unlock(&msp430_misc_data->lock);
 
 	return ret_err;
 }
@@ -832,7 +926,8 @@ static ssize_t dock_print_name(struct switch_dev *switch_dev, char *buf)
 
 static int msp430_as_data_buffer_write(struct msp430_data *ps_msp430,
 	unsigned char type, signed short data1, signed short data2,
-	signed short data3, unsigned char status)
+	signed short data3, signed short data4, signed short data5,
+	signed short data6, unsigned char status)
 {
 	int new_head;
 	struct timespec ts;
@@ -853,6 +948,10 @@ static int msp430_as_data_buffer_write(struct msp430_data *ps_msp430,
 	ps_msp430->msp430_as_data_buffer[new_head].data1 = data1;
 	ps_msp430->msp430_as_data_buffer[new_head].data2 = data2;
 	ps_msp430->msp430_as_data_buffer[new_head].data3 = data3;
+	ps_msp430->msp430_as_data_buffer[new_head].data4 = data4;
+	ps_msp430->msp430_as_data_buffer[new_head].data5 = data5;
+	ps_msp430->msp430_as_data_buffer[new_head].data6 = data6;
+
 	ps_msp430->msp430_as_data_buffer[new_head].status = status;
 
 	ktime_get_ts(&ts);
@@ -971,11 +1070,24 @@ static irqreturn_t msp430_wake_isr(int irq, void *dev)
 	return IRQ_HANDLED;
 }
 
+static unsigned short msp430_get_interrupt_status(struct msp430_data *ps_msp430,
+	unsigned char reg, int *err)
+{
+	msp_cmdbuff[0] = reg;
+	*err = msp430_i2c_write_read(ps_msp430, msp_cmdbuff, 1, 2);
+	if (*err < 0) {
+		dev_err(&ps_msp430->client->dev, "Reading from msp failed\n");
+		return 0;
+	}
+
+	return (read_cmdbuff[1] << 8) | read_cmdbuff[0];
+}
+
 static void msp430_irq_work_func(struct work_struct *work)
 {
 	int err;
 	unsigned short irq_status;
-	signed short x, y, z;
+	signed short x, y, z, x_uncalib;
 	struct msp430_data *ps_msp430 = container_of(work,
 			struct msp430_data, irq_work);
 
@@ -985,15 +1097,10 @@ static void msp430_irq_work_func(struct work_struct *work)
 	dev_dbg(&ps_msp430->client->dev, "msp430_irq_work_func\n");
 	mutex_lock(&ps_msp430->lock);
 
-	/* read interrupt mask register */
-	msp_cmdbuff[0] = INTERRUPT_STATUS;
-	err = msp430_i2c_write_read(ps_msp430, msp_cmdbuff, 1, 2);
-	if (err < 0) {
-		dev_err(&ps_msp430->client->dev,
-			"Reading from msp failed\n");
+	irq_status = msp430_get_interrupt_status(ps_msp430, INTERRUPT_STATUS,
+		&err);
+	if (err < 0)
 		goto EXIT;
-	}
-	irq_status = (read_cmdbuff[1] << 8) | read_cmdbuff[0];
 
 	if (irq_status & M_ACCEL) {
 		/* read accelerometer values from MSP */
@@ -1008,7 +1115,8 @@ static void msp430_irq_work_func(struct work_struct *work)
 		x = (read_cmdbuff[0] << 8) | read_cmdbuff[1];
 		y = (read_cmdbuff[2] << 8) | read_cmdbuff[3];
 		z = (read_cmdbuff[4] << 8) | read_cmdbuff[5];
-		msp430_as_data_buffer_write(ps_msp430, DT_ACCEL, x, y, z, 0);
+		msp430_as_data_buffer_write(ps_msp430, DT_ACCEL,
+			x, y, z, 0, 0, 0, 0);
 
 		dev_dbg(&ps_msp430->client->dev,
 			"Sending acc(x,y,z)values:x=%d,y=%d,z=%d\n",
@@ -1028,7 +1136,7 @@ static void msp430_irq_work_func(struct work_struct *work)
 		y = (read_cmdbuff[2] << 8) | read_cmdbuff[3];
 		z = (read_cmdbuff[4] << 8) | read_cmdbuff[5];
 		msp430_as_data_buffer_write(ps_msp430, DT_LIN_ACCEL,
-			x, y, z, 0);
+			x, y, z, 0, 0, 0, 0);
 
 		dev_dbg(&ps_msp430->client->dev,
 			"Sending lin_acc(x,y,z)values:x=%d,y=%d,z=%d\n",
@@ -1046,7 +1154,7 @@ static void msp430_irq_work_func(struct work_struct *work)
 		x = (read_cmdbuff[0] << 8) | read_cmdbuff[1];
 		y = (read_cmdbuff[2] << 8) | read_cmdbuff[3];
 		z = (read_cmdbuff[4] << 8) | read_cmdbuff[5];
-		msp430_as_data_buffer_write(ps_msp430, DT_MAG, x, y, z,
+		msp430_as_data_buffer_write(ps_msp430, DT_MAG, x, y, z, 0, 0, 0,
 			read_cmdbuff[12]);
 
 		dev_dbg(&ps_msp430->client->dev,
@@ -1057,7 +1165,8 @@ static void msp430_irq_work_func(struct work_struct *work)
 		y = (read_cmdbuff[8] << 8) | read_cmdbuff[9];
 		/* roll value needs to be negated */
 		z = -((read_cmdbuff[10] << 8) | read_cmdbuff[11]);
-		msp430_as_data_buffer_write(ps_msp430, DT_ORIENT, x, y, z,
+		msp430_as_data_buffer_write(ps_msp430, DT_ORIENT,
+			x, y, z, 0, 0, 0,
 			read_cmdbuff[12]);
 
 		dev_dbg(&ps_msp430->client->dev,
@@ -1075,11 +1184,48 @@ static void msp430_irq_work_func(struct work_struct *work)
 		x = (read_cmdbuff[0] << 8) | read_cmdbuff[1];
 		y = (read_cmdbuff[2] << 8) | read_cmdbuff[3];
 		z = (read_cmdbuff[4] << 8) | read_cmdbuff[5];
-		msp430_as_data_buffer_write(ps_msp430, DT_GYRO, x, y, z, 0);
+		msp430_as_data_buffer_write(ps_msp430, DT_GYRO,
+			x, y, z, 0, 0, 0, 0);
 
 		dev_dbg(&ps_msp430->client->dev,
 			"Sending gyro(x,y,z)values:x=%d,y=%d,z=%d\n",
 			x, y, z);
+	}
+	if (irq_status & M_STEP_COUNTER) {
+		msp_cmdbuff[0] = STEP_COUNTER;
+		err = msp430_i2c_write_read(ps_msp430, msp_cmdbuff, 1, 8);
+		if (err < 0) {
+			dev_err(&ps_msp430->client->dev,
+				"Reading step counter failed\n");
+			goto EXIT;
+		}
+		x = (read_cmdbuff[0] << 8) | read_cmdbuff[1];
+		y = (read_cmdbuff[2] << 8) | read_cmdbuff[3];
+		z = (read_cmdbuff[4] << 8) | read_cmdbuff[5];
+		x_uncalib = (read_cmdbuff[6] << 8) | read_cmdbuff[7];
+		msp430_as_data_buffer_write(ps_msp430, DT_STEP_COUNTER,
+			x, y, z, x_uncalib, 0, 0, 0);
+		dev_dbg(&ps_msp430->client->dev,
+			"Sending step counter %X %X %X %X\n",
+			x_uncalib, z, y, x);
+	}
+	if (irq_status & M_STEP_DETECTOR) {
+		unsigned short detected_steps = 0;
+		msp_cmdbuff[0] = STEP_DETECTOR;
+		err = msp430_i2c_write_read(ps_msp430, msp_cmdbuff, 1, 1);
+		if (err < 0) {
+			dev_err(&ps_msp430->client->dev,
+				"Reading step detector  failed\n");
+			goto EXIT;
+		}
+		detected_steps = read_cmdbuff[0];
+		while(detected_steps-- != 0) {
+			msp430_as_data_buffer_write(ps_msp430, DT_STEP_DETECTOR,
+				1, 0, 0, 0, 0, 0, 0);
+
+			dev_dbg(&ps_msp430->client->dev,
+				"Sending step detector\n");
+		}
 	}
 	if (irq_status & M_ALS) {
 		msp_cmdbuff[0] = ALS_LUX;
@@ -1090,7 +1236,8 @@ static void msp430_irq_work_func(struct work_struct *work)
 			goto EXIT;
 		}
 		x = (read_cmdbuff[0] << 8) | read_cmdbuff[1];
-		msp430_as_data_buffer_write(ps_msp430, DT_ALS, x, 0, 0, 0);
+		msp430_as_data_buffer_write(ps_msp430, DT_ALS,
+			x, 0, 0, 0, 0, 0, 0);
 
 		dev_dbg(&ps_msp430->client->dev, "Sending ALS %d\n", x);
 	}
@@ -1104,7 +1251,8 @@ static void msp430_irq_work_func(struct work_struct *work)
 			goto EXIT;
 		}
 		x = (read_cmdbuff[0] << 8) | read_cmdbuff[1];
-		msp430_as_data_buffer_write(ps_msp430, DT_TEMP, x, 0, 0, 0);
+		msp430_as_data_buffer_write(ps_msp430, DT_TEMP,
+			x, 0, 0, 0, 0, 0, 0);
 
 		dev_dbg(&ps_msp430->client->dev,
 			"Sending temp(x)value: %d\n", x);
@@ -1120,7 +1268,8 @@ static void msp430_irq_work_func(struct work_struct *work)
 		}
 		x = (read_cmdbuff[0] << 8) | read_cmdbuff[1];
 		y = (read_cmdbuff[2] << 8) | read_cmdbuff[3];
-		msp430_as_data_buffer_write(ps_msp430, DT_PRESSURE, x, y, 0, 0);
+		msp430_as_data_buffer_write(ps_msp430, DT_PRESSURE,
+			x, y, 0, 0, 0, 0, 0);
 
 		dev_dbg(&ps_msp430->client->dev, "Sending pressure %d\n",
 			(x << 16) | (y & 0xFFFF));
@@ -1139,7 +1288,7 @@ static void msp430_irq_work_func(struct work_struct *work)
 		y = (read_cmdbuff[2] << 8) | read_cmdbuff[3];
 		z = (read_cmdbuff[4] << 8) | read_cmdbuff[5];
 		msp430_as_data_buffer_write(ps_msp430, DT_GRAVITY,
-			x, y, z, 0);
+			x, y, z, 0, 0, 0, 0);
 
 		dev_dbg(&ps_msp430->client->dev,
 			"Sending gravity(x,y,z)values:x=%d,y=%d,z=%d\n",
@@ -1156,7 +1305,7 @@ static void msp430_irq_work_func(struct work_struct *work)
 		}
 		x = read_cmdbuff[0];
 		msp430_as_data_buffer_write(ps_msp430,
-			DT_DISP_ROTATE, x, 0, 0, 0);
+			DT_DISP_ROTATE, x, 0, 0, 0, 0, 0, 0);
 
 		dev_dbg(&ps_msp430->client->dev,
 			"Sending disp_rotate(x)value: %d\n", x);
@@ -1171,7 +1320,7 @@ static void msp430_irq_work_func(struct work_struct *work)
 		}
 		x = read_cmdbuff[0];
 		msp430_as_data_buffer_write(ps_msp430, DT_DISP_BRIGHT,
-			x, 0, 0, 0);
+			x, 0, 0, 0, 0, 0, 0);
 
 		dev_dbg(&ps_msp430->client->dev,
 			"Sending Display Brightness %d\n", x);
@@ -1180,6 +1329,218 @@ static void msp430_irq_work_func(struct work_struct *work)
 EXIT:
 	/* For now HAE needs events even if the activity is still */
 	mutex_unlock(&ps_msp430->lock);
+}
+
+static void msp430_quickpeek_reset_locked(struct msp430_data *ps_msp430)
+{
+	int ret = 0;
+
+	if (ps_msp430->quickpeek_state != QP_IDLE) {
+		/* Drain the current list */
+		struct msp430_quickpeek_message *entry, *entry_tmp;
+		list_for_each_entry_safe(entry, entry_tmp,
+			&ps_msp430->quickpeek_command_list, list) {
+			list_del(&entry->list);
+			kfree(entry);
+		}
+
+		if (ps_msp430->quickpeek_state == QP_PREPARED) {
+			/* Cleanup fb driver state */
+			ret = msp430_quickdraw_ops->cleanup(
+				msp430_quickdraw_ops->data);
+			if (ret)
+				dev_err(&ps_msp430->client->dev,
+					"%s: Failed to cleanup (ret: %d)\n",
+					__func__, ret);
+		}
+
+		wake_unlock(&ps_msp430->quickpeek_wakelock);
+		complete(&ps_msp430->quickpeek_done);
+		ps_msp430->quickpeek_state = QP_IDLE;
+	}
+}
+
+static int msp430_quickpeek_status_ack(struct msp430_data *ps_msp430,
+	struct msp430_quickpeek_message *qp_message, int ack_return)
+{
+	int ret = 0;
+	unsigned char payload = ack_return & 0x03;
+	unsigned int req_bit = atomic_read(&ps_msp430->qp_enabled) & 0x01;
+
+	if (qp_message && qp_message->message == AOD_WAKEUP_REASON_QP_DRAW)
+		payload |= (qp_message->buffer_id &
+			AOD_QP_ACK_BUFFER_ID_MASK) << 2;
+
+	msp_cmdbuff[0] = MSP_PEEKSTATUS_REG;
+	msp_cmdbuff[1] = req_bit;
+	msp_cmdbuff[2] = qp_message ? qp_message->message : 0x00;
+	msp_cmdbuff[3] = payload;
+	if (msp430_i2c_write(ps_msp430, msp_cmdbuff, 4) < 0) {
+		dev_err(&ps_msp430->client->dev,
+			"Write peek status reg failed\n");
+		ret = -EIO;
+	}
+
+	dev_dbg(&ps_msp430->client->dev, "%s: message: %d | req_bit: %d"
+		" | ack_return: %d |  buffer_id: %d | ret: %d\n", __func__,
+		qp_message ? qp_message->message : 0, req_bit, ack_return,
+		qp_message ? qp_message->buffer_id : 0, ret);
+
+	return ret;
+}
+
+static void msp430_quickpeek_work_func(struct work_struct *work)
+{
+	struct msp430_data *ps_msp430 = container_of(work,
+			struct msp430_data, quickpeek_work);
+	int ret;
+
+	dev_dbg(&ps_msp430->client->dev, "%s+\n", __func__);
+
+	if (!msp430_quickdraw_ops) {
+		dev_err(&ps_msp430->client->dev,
+			"no quickdraw_ops registered\n");
+		goto EXIT;
+	}
+
+	mutex_lock(&ps_msp430->lock);
+
+	while (atomic_read(&ps_msp430->qp_enabled) &&
+	       !list_empty(&ps_msp430->quickpeek_command_list)) {
+		struct msp430_quickpeek_message *qp_message;
+		int ack_return = AOD_QP_ACK_SUCCESS;
+		int x = -1;
+		int y = -1;
+
+		qp_message = list_first_entry(
+			&ps_msp430->quickpeek_command_list,
+			struct msp430_quickpeek_message, list);
+		list_del(&qp_message->list);
+
+		switch (qp_message->message) {
+		case AOD_WAKEUP_REASON_QP_PREPARE:
+			if (ps_msp430->quickpeek_state != QP_AWAKE) {
+				dev_err(&ps_msp430->client->dev,
+					"%s: ILLEGAL STATE TRANSITION (%d during %d)\n",
+					__func__, ps_msp430->quickpeek_state,
+					qp_message->message);
+				ack_return = AOD_QP_ACK_BAD_MSG_ORDER;
+				break;
+			}
+			ret = msp430_quickdraw_ops->prepare(
+				msp430_quickdraw_ops->data,
+				qp_message->panel_state);
+			if (ret == QUICKDRAW_ESD_RECOVERED) {
+				dev_info(&ps_msp430->client->dev,
+					"%s: ESD Recovered: %d\n", __func__,
+					ret);
+				ack_return = AOD_QP_ACK_ESD_RECOVERED;
+				ps_msp430->quickpeek_state = QP_PREPARED;
+			} else if (ret) {
+				dev_err(&ps_msp430->client->dev,
+					"%s: Prepare Error: %d\n", __func__,
+					ret);
+				ack_return = AOD_QP_ACK_INVALID;
+			} else
+				ps_msp430->quickpeek_state = QP_PREPARED;
+			break;
+		case AOD_WAKEUP_REASON_QP_DRAW:
+			if (!(ps_msp430->quickpeek_state == QP_PREPARED)) {
+				dev_err(&ps_msp430->client->dev,
+					"%s: ILLEGAL STATE TRANSITION (%d during %d)\n",
+					__func__, ps_msp430->quickpeek_state,
+					qp_message->message);
+				ack_return = AOD_QP_ACK_BAD_MSG_ORDER;
+				break;
+			}
+			if (qp_message->buffer_id > AOD_QP_DRAW_MAX_BUFFER_ID) {
+				dev_err(&ps_msp430->client->dev,
+					"%s: ILLEGAL buffer_id: %d\n", __func__,
+					qp_message->buffer_id);
+				ack_return = AOD_QP_ACK_INVALID;
+				break;
+			}
+			if (qp_message->x1 != AOD_QP_DRAW_NO_OVERRIDE)
+				x = qp_message->x1;
+			if (qp_message->y1 != AOD_QP_DRAW_NO_OVERRIDE)
+				y = qp_message->y1;
+			ret = msp430_quickdraw_ops->execute(
+				msp430_quickdraw_ops->data,
+				qp_message->buffer_id, x, y);
+			if (ret) {
+				dev_err(&ps_msp430->client->dev,
+					"%s: Failed to execute (ret: %d)\n",
+					__func__, ret);
+				ack_return = AOD_QP_ACK_INVALID;
+			}
+			break;
+		case AOD_WAKEUP_REASON_QP_ERASE:
+			if (!(ps_msp430->quickpeek_state == QP_PREPARED)) {
+				dev_err(&ps_msp430->client->dev,
+					"%s: ILLEGAL STATE TRANSITION (%d during %d)\n",
+					__func__, ps_msp430->quickpeek_state,
+					qp_message->message);
+				ack_return = AOD_QP_ACK_BAD_MSG_ORDER;
+				break;
+			}
+			if (qp_message->x2 <= qp_message->x1 ||
+			    qp_message->y2 <= qp_message->y1) {
+				dev_err(&ps_msp430->client->dev,
+					"%s: ILLEGAL coordinates\n", __func__);
+				ack_return = AOD_QP_ACK_INVALID;
+				break;
+			}
+			ret = msp430_quickdraw_ops->erase(
+				msp430_quickdraw_ops->data,
+				qp_message->x1, qp_message->y1,
+				qp_message->x2, qp_message->y2);
+			if (ret) {
+				dev_err(&ps_msp430->client->dev,
+					"%s: Failed to erase (ret: %d)\n",
+					__func__, ret);
+				ack_return = AOD_QP_ACK_INVALID;
+			}
+			break;
+		case AOD_WAKEUP_REASON_QP_COMPLETE:
+			if (!(ps_msp430->quickpeek_state == QP_PREPARED)) {
+				dev_err(&ps_msp430->client->dev,
+					"%s: ILLEGAL STATE TRANSITION (%d during %d)\n",
+					__func__, ps_msp430->quickpeek_state,
+					qp_message->message);
+				ack_return = AOD_QP_ACK_BAD_MSG_ORDER;
+				break;
+			}
+			ps_msp430->quickpeek_state = QP_AWAKE;
+			ret = msp430_quickdraw_ops->cleanup(
+				msp430_quickdraw_ops->data);
+			if (ret) {
+				dev_err(&ps_msp430->client->dev,
+					"%s: Failed to cleanup (ret: %d)\n",
+					__func__, ret);
+				ack_return = AOD_QP_ACK_INVALID;
+			}
+			break;
+		default:
+			dev_err(&ps_msp430->client->dev,
+				"%s: Unknown quickpeek message: %d\n", __func__,
+				qp_message->message);
+			break;
+		}
+
+		msp430_quickpeek_status_ack(ps_msp430, qp_message, ack_return);
+		kfree(qp_message);
+	}
+
+	if (ps_msp430->quickpeek_state == QP_AWAKE) {
+		wake_unlock(&ps_msp430->quickpeek_wakelock);
+		complete(&ps_msp430->quickpeek_done);
+		ps_msp430->quickpeek_state = QP_IDLE;
+	}
+
+	mutex_unlock(&ps_msp430->lock);
+
+EXIT:
+	dev_dbg(&ps_msp430->client->dev, "%s-\n", __func__);
 }
 
 static void msp430_irq_wake_work_func(struct work_struct *work)
@@ -1198,23 +1559,19 @@ static void msp430_irq_wake_work_func(struct work_struct *work)
 	dev_dbg(&ps_msp430->client->dev, "msp430_irq_wake_work_func\n");
 	mutex_lock(&ps_msp430->lock);
 
-	/* read interrupt mask register */
-	msp_cmdbuff[0] = WAKESENSOR_STATUS;
-	err = msp430_i2c_write_read(ps_msp430, msp_cmdbuff, 1, 2);
-	if (err < 0) {
-		dev_err(&ps_msp430->client->dev, "Reading from msp failed\n");
+	irq_status = msp430_get_interrupt_status(ps_msp430, WAKESENSOR_STATUS,
+		&err);
+	if (err < 0)
 		goto EXIT;
-	}
-	irq_status = (read_cmdbuff[1] << 8) | read_cmdbuff[0];
+	irq2_status = msp430_get_interrupt_status(ps_msp430, ALGO_INT_STATUS,
+		&err);
+	if (err < 0)
+		goto EXIT;
 
-	/* read algorithm interrupt status register */
-	msp_cmdbuff[0] = ALGO_INT_STATUS;
-	err = msp430_i2c_write_read(ps_msp430, msp_cmdbuff, 1, 2);
-	if (err < 0) {
-		dev_err(&ps_msp430->client->dev, "Reading from msp failed\n");
-		goto EXIT;
+	if (ps_msp430->qw_irq_status) {
+		irq_status |= ps_msp430->qw_irq_status;
+		ps_msp430->qw_irq_status = 0;
 	}
-	irq2_status = (read_cmdbuff[1] << 8) | read_cmdbuff[0];
 
 	/* read generic interrupt register */
 	msp_cmdbuff[0] = GENERIC_INT_STATUS;
@@ -1251,7 +1608,8 @@ static void msp430_irq_wake_work_func(struct work_struct *work)
 		else
 			x = 0x04;
 
-		msp430_as_data_buffer_write(ps_msp430, DT_RESET, x, 0, 0, 0);
+		msp430_as_data_buffer_write(ps_msp430, DT_RESET,
+			x, 0, 0,  0, 0, 0, 0);
 
 		msp430_reset_and_init();
 		dev_err(&ps_msp430->client->dev, "MSP430 requested a reset\n");
@@ -1268,7 +1626,8 @@ static void msp430_irq_wake_work_func(struct work_struct *work)
 			goto EXIT;
 		}
 		x = read_cmdbuff[0];
-		msp430_as_data_buffer_write(ps_msp430, DT_DOCK, x, 0, 0, 0);
+		msp430_as_data_buffer_write(ps_msp430, DT_DOCK,
+			x, 0, 0, 0, 0, 0, 0);
 		if (ps_msp430->dsdev.dev != NULL)
 			switch_set_state(&ps_msp430->dsdev, x);
 		if (ps_msp430->edsdev.dev != NULL)
@@ -1285,13 +1644,16 @@ static void msp430_irq_wake_work_func(struct work_struct *work)
 			goto EXIT;
 		}
 		x = read_cmdbuff[0];
-		msp430_as_data_buffer_write(ps_msp430, DT_PROX, x, 0, 0, 0);
+		msp430_as_data_buffer_write(ps_msp430, DT_PROX,
+			x, 0, 0, 0, 0, 0, 0);
 
 		dev_dbg(&ps_msp430->client->dev,
 			"Sending Proximity distance %d\n", x);
 	}
 	if (irq_status & M_TOUCH) {
+		char *envp[2];
 		u8 aod_wake_up_reason;
+
 		msp_cmdbuff[0] = MSP_STATUS_REG;
 		if (msp430_i2c_write_read(ps_msp430, msp_cmdbuff, 1, 2) < 0) {
 			dev_err(&ps_msp430->client->dev,
@@ -1299,26 +1661,24 @@ static void msp430_irq_wake_work_func(struct work_struct *work)
 			goto EXIT;
 		}
 		aod_wake_up_reason = (read_cmdbuff[1] >> 4) & 0xf;
+
 		if (aod_wake_up_reason == AOD_WAKEUP_REASON_ESD) {
-			char *envp[2];
 			envp[0] = "MSP430WAKE=ESD";
 			envp[1] = NULL;
-			if (kobject_uevent_env(&ps_msp430->client->dev.kobj,
-				KOBJ_CHANGE, envp)) {
-				dev_err(&ps_msp430->client->dev,
-					"Failed to create uevent\n");
-				goto EXIT;
-			}
-			sysfs_notify(&ps_msp430->client->dev.kobj,
-				NULL, "msp430_esd");
 			dev_info(&ps_msp430->client->dev,
-				"Sent uevent, MSP430 ESD wake\n");
+				"Sending uevent, MSP430 ESD wake\n");
 		} else {
-			input_report_key(ps_msp430->input_dev, KEY_POWER, 1);
-			input_report_key(ps_msp430->input_dev, KEY_POWER, 0);
-			input_sync(ps_msp430->input_dev);
+			envp[0] = "MSP430WAKE=TOUCH";
+			envp[1] = NULL;
 			dev_info(&ps_msp430->client->dev,
-				"Report pwrkey toggle, touch event wake\n");
+				"Sending uevent, MSP430 TOUCH wake\n");
+		}
+
+		if (kobject_uevent_env(&ps_msp430->client->dev.kobj,
+			KOBJ_CHANGE, envp)) {
+			dev_err(&ps_msp430->client->dev,
+				"Failed to create uevent\n");
+			goto EXIT;
 		}
 	}
 	if (irq_status & M_FLATUP) {
@@ -1330,7 +1690,8 @@ static void msp430_irq_wake_work_func(struct work_struct *work)
 			goto EXIT;
 		}
 		x = read_cmdbuff[0];
-		msp430_as_data_buffer_write(ps_msp430, DT_FLAT_UP, x, 0, 0, 0);
+		msp430_as_data_buffer_write(ps_msp430, DT_FLAT_UP,
+			x, 0, 0, 0, 0, 0, 0);
 
 		dev_dbg(&ps_msp430->client->dev, "Sending Flat up %d\n", x);
 	}
@@ -1344,7 +1705,7 @@ static void msp430_irq_wake_work_func(struct work_struct *work)
 		}
 		x = read_cmdbuff[0];
 		msp430_as_data_buffer_write(ps_msp430,
-			DT_FLAT_DOWN, x, 0, 0, 0);
+			DT_FLAT_DOWN, x, 0, 0, 0, 0, 0, 0);
 
 		dev_dbg(&ps_msp430->client->dev, "Sending Flat down %d\n", x);
 	}
@@ -1357,7 +1718,8 @@ static void msp430_irq_wake_work_func(struct work_struct *work)
 			goto EXIT;
 		}
 		x = read_cmdbuff[0];
-		msp430_as_data_buffer_write(ps_msp430, DT_STOWED, x, 0, 0, 0);
+		msp430_as_data_buffer_write(ps_msp430, DT_STOWED,
+			x, 0, 0, 0, 0, 0, 0);
 
 		dev_dbg(&ps_msp430->client->dev,
 			"Sending Stowed status %d\n", x);
@@ -1374,7 +1736,7 @@ static void msp430_irq_wake_work_func(struct work_struct *work)
 		y = (read_cmdbuff[0] << 8) | read_cmdbuff[1];
 
 		msp430_as_data_buffer_write(ps_msp430, DT_CAMERA_ACT,
-					x, y, 0, 0);
+					x, y, 0, 0, 0, 0, 0);
 
 		dev_dbg(&ps_msp430->client->dev,
 				"Sending Camera(x,y,z)values:x=%d,y=%d,z=%d\n",
@@ -1397,7 +1759,7 @@ static void msp430_irq_wake_work_func(struct work_struct *work)
 		}
 		x = read_cmdbuff[0];
 		msp430_as_data_buffer_write(ps_msp430, DT_NFC,
-			x, 0, 0, 0);
+			x, 0, 0, 0, 0, 0, 0);
 
 		dev_dbg(&ps_msp430->client->dev,
 			"Sending NFC(x,y,z)values:x=%d,y=%d,z=%d\n",
@@ -1415,7 +1777,7 @@ static void msp430_irq_wake_work_func(struct work_struct *work)
 		x = (read_cmdbuff[0] << 8) | read_cmdbuff[1];
 
 		msp430_as_data_buffer_write(ps_msp430, DT_SIM,
-					x, 0, 0, 0);
+					x, 0, 0, 0, 0, 0, 0);
 
 		/* This is one shot sensor */
 		g_wake_sensor_state &= (~M_SIM);
@@ -1424,6 +1786,121 @@ static void msp430_irq_wake_work_func(struct work_struct *work)
 				"Sending SIM(x,y,z)values:x=%d,y=%d,z=%d\n",
 				x, 0, 0);
 
+	}
+	if (irq_status & M_QUICKPEEK) {
+		u8 aod_qp_reason;
+		u8 aod_qp_panel_state;
+		struct msp430_quickpeek_message *qp_message;
+
+		if (!msp430_quickdraw_ops) {
+			dev_err(&ps_msp430->client->dev,
+				"no quickdraw_ops registered\n");
+			msp430_quickpeek_status_ack(ps_msp430, NULL,
+				AOD_QP_ACK_INVALID);
+			goto EXIT;
+		}
+
+		if (ps_msp430->quickpeek_state == QP_IDLE)
+			ps_msp430->quickpeek_state = QP_AWAKE;
+
+		wake_lock(&ps_msp430->quickpeek_wakelock);
+		/* If this is only us, we dont need a full 1 sec */
+		if (irq_status == M_QUICKPEEK)
+			wake_unlock(&ps_msp430->wakelock);
+
+		msp_cmdbuff[0] = MSP_STATUS_REG;
+		if (msp430_i2c_write_read(ps_msp430, msp_cmdbuff, 1, 2) < 0) {
+			dev_err(&ps_msp430->client->dev,
+				"Get status reg failed\n");
+			msp430_quickpeek_status_ack(ps_msp430, NULL,
+				AOD_QP_ACK_INVALID);
+			goto EXIT;
+		}
+
+		aod_qp_panel_state = read_cmdbuff[0] & 0x3;
+		aod_qp_reason = (read_cmdbuff[1] >> 4) & 0xf;
+
+		qp_message = kzalloc(sizeof(*qp_message), GFP_KERNEL);
+		if (!qp_message) {
+			dev_err(&ps_msp430->client->dev,
+				"%s: kzalloc failed!\n", __func__);
+			msp430_quickpeek_status_ack(ps_msp430, NULL,
+				AOD_QP_ACK_INVALID);
+			goto EXIT;
+		}
+
+		qp_message->panel_state = aod_qp_panel_state;
+		qp_message->message = aod_qp_reason;
+
+		switch (aod_qp_reason) {
+		case AOD_WAKEUP_REASON_QP_PREPARE:
+			dev_dbg(&ps_msp430->client->dev,
+				"Received peek prepare command\n");
+			list_add_tail(&qp_message->list,
+				&ps_msp430->quickpeek_command_list);
+			queue_work(ps_msp430->quickpeek_work_queue,
+				&ps_msp430->quickpeek_work);
+			break;
+		case AOD_WAKEUP_REASON_QP_COMPLETE:
+			dev_dbg(&ps_msp430->client->dev,
+				"Received peek complete command\n");
+			list_add_tail(&qp_message->list,
+				&ps_msp430->quickpeek_command_list);
+			queue_work(ps_msp430->quickpeek_work_queue,
+				&ps_msp430->quickpeek_work);
+			break;
+		case AOD_WAKEUP_REASON_QP_DRAW:
+			msp_cmdbuff[0] = MSP_PEEKDATA_REG;
+			err = msp430_i2c_write_read(ps_msp430,
+				msp_cmdbuff, 1, 5);
+			if (err < 0) {
+				dev_err(&ps_msp430->client->dev,
+					"Reading peek draw data from msp failed\n");
+				msp430_quickpeek_status_ack(ps_msp430,
+					qp_message, AOD_QP_ACK_INVALID);
+				goto EXIT;
+			}
+			qp_message->buffer_id = read_cmdbuff[0] & 0x3f;
+			qp_message->x1 = read_cmdbuff[1] | read_cmdbuff[2] << 8;
+			qp_message->y1 = read_cmdbuff[3] | read_cmdbuff[4] << 8;
+
+			dev_dbg(&ps_msp430->client->dev,
+				"Received peek draw command for buffer: %d (coord: %d, %d)\n",
+				qp_message->buffer_id,
+				qp_message->x1, qp_message->y1);
+
+			list_add_tail(&qp_message->list,
+				&ps_msp430->quickpeek_command_list);
+			queue_work(ps_msp430->quickpeek_work_queue,
+				&ps_msp430->quickpeek_work);
+			break;
+		case AOD_WAKEUP_REASON_QP_ERASE:
+			msp_cmdbuff[0] = MSP_PEEKDATA_REG;
+			err = msp430_i2c_write_read(ps_msp430,
+				msp_cmdbuff, 1, 9);
+			if (err < 0) {
+				dev_err(&ps_msp430->client->dev,
+					"Reading peek erase data from msp failed\n");
+				msp430_quickpeek_status_ack(ps_msp430,
+					qp_message, AOD_QP_ACK_INVALID);
+				goto EXIT;
+			}
+			qp_message->x1 = read_cmdbuff[1] | read_cmdbuff[2] << 8;
+			qp_message->y1 = read_cmdbuff[3] | read_cmdbuff[4] << 8;
+			qp_message->x2 = read_cmdbuff[5] | read_cmdbuff[6] << 8;
+			qp_message->y2 = read_cmdbuff[7] | read_cmdbuff[8] << 8;
+
+			dev_dbg(&ps_msp430->client->dev,
+				"Received peek erase command: (%d, %d) -> (%d, %d)\n",
+				qp_message->x1, qp_message->y1,
+				qp_message->x2, qp_message->y2);
+
+			list_add_tail(&qp_message->list,
+				&ps_msp430->quickpeek_command_list);
+			queue_work(ps_msp430->quickpeek_work_queue,
+				&ps_msp430->quickpeek_work);
+			break;
+		}
 	}
 	if (irq2_status & M_MMOVEME) {
 		/* Client recieving action will be upper 2 MSB of status */
@@ -2017,6 +2494,20 @@ static long msp430_misc_ioctl(struct file *file, unsigned int cmd,
 		g_gyro_delay = delay;
 		err = msp430_i2c_write(ps_msp430, msp_cmdbuff, 2);
 		break;
+	case MSP430_IOCTL_SET_STEP_COUNTER_DELAY:
+		delay = 0;
+		if (copy_from_user(&delay, argp, sizeof(delay))) {
+			dev_dbg(&ps_msp430->client->dev,
+				"Copy step counter delay returned error\n");
+			err = -EFAULT;
+			break;
+		}
+		msp_cmdbuff[0] = STEP_COUNTER_UPDATE_RATE;
+		msp_cmdbuff[1] = (delay>>8);
+		msp_cmdbuff[2] = delay;
+		g_step_counter_delay = delay;
+		err = msp430_i2c_write(ps_msp430, msp_cmdbuff, 3);
+		break;
 	case MSP430_IOCTL_SET_PRES_DELAY:
 		dev_dbg(&ps_msp430->client->dev,
 			"MSP430_IOCTL_SET_PRES_DELAY");
@@ -2265,6 +2756,7 @@ static long msp430_misc_ioctl(struct file *file, unsigned int cmd,
 			err = -EFAULT;
 			break;
 		}
+		g_control_reg_restore = 1;
 		memcpy(g_control_reg, &msp_cmdbuff[1], MSP_CONTROL_REG_SIZE);
 
 		err = msp430_i2c_write(ps_msp430, msp_cmdbuff,
@@ -2272,8 +2764,6 @@ static long msp430_misc_ioctl(struct file *file, unsigned int cmd,
 		if (err < 0)
 			dev_err(&msp430_misc_data->client->dev,
 				"unable to write control reg %d\n", err);
-		else
-			ps_msp430->ap_msp_handoff_enable = true;
 
 		break;
 	case MSP430_IOCTL_GET_AOD_INSTRUMENTATION_REG:
@@ -2485,6 +2975,21 @@ static long msp430_misc_ioctl(struct file *file, unsigned int cmd,
 			break;
 		}
 
+		break;
+	case MSP430_IOCTL_ENABLE_BREATHING:
+		if (copy_from_user(&byte, argp, sizeof(byte))) {
+			dev_err(&ps_msp430->client->dev,
+			    "Enable Breathing, copy byte returned error\n");
+			err = -EFAULT;
+			break;
+		}
+		if (byte)
+			msp430_vote_aod_enabled(ps_msp430,
+				AOD_QP_ENABLED_VOTE_USER, true);
+		else
+			msp430_vote_aod_enabled(ps_msp430,
+				AOD_QP_ENABLED_VOTE_USER, false);
+		msp430_resolve_aod_enabled_locked(ps_msp430);
 		break;
 	/* No default here since previous switch could have
 	   handled the command and cannot over write that */
@@ -2816,9 +3321,9 @@ static int msp430_gpio_init(struct msp430_platform_data *pdata,
 				"mipi_req_gpio gpio_export failed: %d\n", err);
 			goto free_mipi_req;
 		}
-		msp430_misc_data->ap_msp_handoff_ctrl = true;
+		msp430_misc_data->ap_msp_handoff_gpio_ctrl = true;
 	} else {
-		msp430_misc_data->ap_msp_handoff_ctrl = false;
+		msp430_misc_data->ap_msp_handoff_gpio_ctrl = false;
 		pr_warn("%s: gpio mipi req not specified\n", __func__);
 	}
 
@@ -2837,7 +3342,7 @@ static int msp430_gpio_init(struct msp430_platform_data *pdata,
 			goto free_mipi_busy;
 		}
 	} else {
-		msp430_misc_data->ap_msp_handoff_ctrl = false;
+		msp430_misc_data->ap_msp_handoff_gpio_ctrl = false;
 		pr_warn("%s: gpio mipi busy not specified\n", __func__);
 	}
 
@@ -2938,10 +3443,10 @@ static int msp430_probe(struct i2c_client *client,
 	mutex_lock(&ps_msp430->lock);
 	wake_lock_init(&ps_msp430->wakelock, WAKE_LOCK_SUSPEND, "msp430");
 
+	mutex_init(&ps_msp430->aod_enabled.vote_lock);
+
 	ps_msp430->client = client;
 	ps_msp430->mode = UNINITIALIZED;
-	ps_msp430->ap_msp_handoff_enable = false;
-
 
 	/* Set to passive mode by default */
 	g_nonwake_sensor_state = 0;
@@ -3095,12 +3600,33 @@ static int msp430_probe(struct i2c_client *client,
 		goto err9;
 	}
 
+
+	msp430_quickwakeup_ops.data = ps_msp430;
+	quickwakeup_register(&msp430_quickwakeup_ops);
+
+	ps_msp430->quickpeek_work_queue =
+		create_singlethread_workqueue("msp430_quickpeek_wq");
+	if (!ps_msp430->quickpeek_work_queue) {
+		err = -ENOMEM;
+		dev_err(&client->dev, "cannot create work queue: %d\n", err);
+		goto err10;
+	}
+	INIT_WORK(&ps_msp430->quickpeek_work, msp430_quickpeek_work_func);
+	wake_lock_init(&ps_msp430->quickpeek_wakelock, WAKE_LOCK_SUSPEND,
+		"msp430_quickpeek");
+	init_completion(&ps_msp430->quickpeek_done);
+	ps_msp430->quickpeek_state = QP_IDLE;
+	INIT_LIST_HEAD(&ps_msp430->quickpeek_command_list);
+	atomic_set(&ps_msp430->qp_enabled, 0);
+
 	mutex_unlock(&ps_msp430->lock);
 
 	dev_info(&client->dev, "probed finished\n");
 
 	return 0;
 
+err10:
+	input_unregister_device(ps_msp430->input_dev);
 err9:
 	input_free_device(ps_msp430->input_dev);
 err8:
@@ -3158,7 +3684,64 @@ static int msp430_remove(struct i2c_client *client)
 	regulator_disable(ps_msp430->vio_regulator);
 	regulator_put(ps_msp430->vcc_regulator);
 	regulator_put(ps_msp430->vio_regulator);
+
+	destroy_workqueue(ps_msp430->quickpeek_work_queue);
+	wake_unlock(&ps_msp430->quickpeek_wakelock);
+	wake_lock_destroy(&ps_msp430->quickpeek_wakelock);
+
 	kfree(ps_msp430);
+
+	return 0;
+}
+
+static int msp430_takeback_locked(struct msp430_data *ps_msp430)
+{
+	int count = 0;
+	int msp_req = ps_msp430->pdata->gpio_mipi_req;
+
+	dev_dbg(&msp430_misc_data->client->dev, "%s\n", __func__);
+
+	if (ps_msp430->mode == NORMALMODE) {
+		if (ps_msp430->ap_msp_handoff_gpio_ctrl) {
+			/* Legacy GPIO Usage */
+			gpio_set_value(msp_req, 0);
+			dev_dbg(&ps_msp430->client->dev, "MSP REQ is set %d\n",
+				 gpio_get_value(msp_req));
+		}
+
+		/* New I2C Implementation */
+		msp_cmdbuff[0] = MSP_PEEKSTATUS_REG;
+		msp_cmdbuff[1] = 0x00;
+		if (msp430_i2c_write(ps_msp430, msp_cmdbuff, 2) < 0) {
+			dev_err(&ps_msp430->client->dev,
+				"Write peek status reg failed\n");
+			goto EXIT;
+		}
+
+		do {
+			msp_cmdbuff[0] = MSP_STATUS_REG;
+			if (msp430_i2c_write_read(ps_msp430,
+					msp_cmdbuff, 1, 1) < 0) {
+				dev_err(&ps_msp430->client->dev,
+					"Get status reg failed\n");
+				goto EXIT;
+			}
+
+			if (!(read_cmdbuff[0] & MSP_BUSY_STATUS_MASK))
+				break;
+
+			usleep_range(MSP_BUSY_SLEEP_USEC,
+						MSP_BUSY_SLEEP_USEC);
+			count++;
+		} while (count < MSP_BUSY_RESUME_COUNT);
+
+		if (count == MSP_BUSY_RESUME_COUNT)
+			dev_err(&ps_msp430->client->dev,
+				"timedout while waiting for MSP BUSY LOW\n");
+	}
+
+EXIT:
+	msp430_quickpeek_reset_locked(ps_msp430);
 
 	return 0;
 }
@@ -3166,75 +3749,64 @@ static int msp430_remove(struct i2c_client *client)
 static int msp430_resume(struct i2c_client *client)
 {
 	struct msp430_data *ps_msp430 = i2c_get_clientdata(client);
-	int count = 0, level = 0;
-	int msp_req = ps_msp430->pdata->gpio_mipi_req;
-	int msp_busy = ps_msp430->pdata->gpio_mipi_busy;
-	dev_dbg(&msp430_misc_data->client->dev, "msp430_resume\n");
+	int ret;
+
+	dev_dbg(&msp430_misc_data->client->dev, "%s\n", __func__);
+
+	msp430_vote_aod_enabled(ps_msp430, AOD_QP_ENABLED_VOTE_KERN, false);
+
 	mutex_lock(&ps_msp430->lock);
 
-	if (ps_msp430->mode == NORMALMODE) {
-		if ((ps_msp430->ap_msp_handoff_enable)
-			&& (ps_msp430->ap_msp_handoff_ctrl)) {
-			gpio_set_value(msp_req, 0);
-			dev_dbg(&ps_msp430->client->dev, "MSP REQ is set %d\n",
-				 gpio_get_value(msp_req));
-		}
-
-		/* read interrupt mask register to clear
-			any interrupt during suspend state */
-		msp_cmdbuff[0] = INTERRUPT_STATUS;
-		msp430_i2c_write_read(ps_msp430, msp_cmdbuff, 1, 2);
-
-		if ((ps_msp430->ap_msp_handoff_enable)
-			&& (ps_msp430->ap_msp_handoff_ctrl)) {
-			do {
-				usleep_range(MSP_BUSY_SLEEP_USEC,
-						 MSP_BUSY_SLEEP_USEC);
-				level = gpio_get_value(msp_busy);
-				count++;
-			} while ((level) && (count < MSP_BUSY_RESUME_COUNT));
-
-			if (count == MSP_BUSY_RESUME_COUNT)
-				dev_err(&ps_msp430->client->dev,
-					"timedout while waiting for MSP BUSY LOW\n");
-		}
-		ps_msp430->ap_msp_handoff_enable = false;
-	}
+	ret = msp430_resolve_aod_enabled_locked(ps_msp430);
 
 	mutex_unlock(&ps_msp430->lock);
-	return 0;
+
+	return ret;
+}
+
+static int msp430_handover_locked(struct msp430_data *ps_msp430)
+{
+	int ret = 0, msp_req = ps_msp430->pdata->gpio_mipi_req;
+
+	dev_dbg(&msp430_misc_data->client->dev, "%s\n", __func__);
+
+	if (ps_msp430->mode == NORMALMODE) {
+		if (ps_msp430->ap_msp_handoff_gpio_ctrl) {
+			/* Legacy GPIO Usage */
+			gpio_set_value(msp_req, 1);
+		}
+
+		/* New I2C Implementation */
+		msp_cmdbuff[0] = MSP_PEEKSTATUS_REG;
+		msp_cmdbuff[1] = 0x01;
+		if (msp430_i2c_write(ps_msp430, msp_cmdbuff, 2) < 0) {
+			dev_err(&ps_msp430->client->dev,
+				"Write peek status reg failed\n");
+			ret = -EIO;
+		}
+		dev_dbg(&ps_msp430->client->dev, "MSP REQ is set %d\n",
+			 gpio_get_value(msp_req));
+	}
+
+	return ret;
 }
 
 static int msp430_suspend(struct i2c_client *client, pm_message_t mesg)
 {
 	struct msp430_data *ps_msp430 = i2c_get_clientdata(client);
-	int count = 0, level = 0;
-	int msp_req = ps_msp430->pdata->gpio_mipi_req;
-	int msp_busy = ps_msp430->pdata->gpio_mipi_busy;
-	dev_dbg(&ps_msp430->client->dev, "msp430_suspend\n");
+	int ret;
+
+	dev_dbg(&msp430_misc_data->client->dev, "%s\n", __func__);
+
+	msp430_vote_aod_enabled(ps_msp430, AOD_QP_ENABLED_VOTE_KERN, true);
+
 	mutex_lock(&ps_msp430->lock);
 
-	if ((ps_msp430->mode == NORMALMODE)
-		 && (ps_msp430->ap_msp_handoff_enable)
-		 && (ps_msp430->ap_msp_handoff_ctrl)) {
-
-		gpio_set_value(msp_req, 1);
-		dev_dbg(&ps_msp430->client->dev, "MSP REQ is set %d\n",
-			 gpio_get_value(msp_req));
-
-		do {
-			usleep_range(MSP_BUSY_SLEEP_USEC, MSP_BUSY_SLEEP_USEC);
-			level = gpio_get_value(msp_busy);
-			count++;
-		} while ((!level) && (count < MSP_BUSY_SUSPEND_COUNT));
-
-		if (count == MSP_BUSY_SUSPEND_COUNT)
-			dev_err(&ps_msp430->client->dev,
-				"timedout while waiting for MSP BUSY HIGH\n");
-	}
+	ret = msp430_resolve_aod_enabled_locked(ps_msp430);
 
 	mutex_unlock(&ps_msp430->lock);
-	return 0;
+
+	return ret;
 }
 
 #ifdef CONFIG_HAS_EARLYSUSPEND
@@ -3255,6 +3827,55 @@ static void msp430_late_resume(struct early_suspend *handler)
 }
 #endif
 
+static int msp430_resolve_aod_enabled_locked(struct msp430_data *ps_msp430)
+{
+	int ret = 0;
+
+	dev_dbg(&ps_msp430->client->dev, "%s\n", __func__);
+
+	mutex_lock(&ps_msp430->aod_enabled.vote_lock);
+
+	if ((ps_msp430->aod_enabled.resolved_vote == AOD_QP_ENABLED_VOTE_MASK)
+	   != (ps_msp430->aod_enabled.vote == AOD_QP_ENABLED_VOTE_MASK)) {
+
+		ps_msp430->aod_enabled.resolved_vote =
+			ps_msp430->aod_enabled.vote;
+
+		if (atomic_read(&ps_msp430->qp_enabled))
+			ret = msp430_handover_locked(ps_msp430);
+		else
+			ret = msp430_takeback_locked(ps_msp430);
+	}
+
+	mutex_unlock(&ps_msp430->aod_enabled.vote_lock);
+
+	return ret;
+}
+
+static void msp430_vote_aod_enabled(struct msp430_data *ps_msp430, int voter,
+				    bool enable)
+{
+	dev_dbg(&ps_msp430->client->dev, "%s\n", __func__);
+
+	mutex_lock(&ps_msp430->aod_enabled.vote_lock);
+
+	voter &= AOD_QP_ENABLED_VOTE_MASK;
+	if (enable)
+		ps_msp430->aod_enabled.vote |= voter;
+	else
+		ps_msp430->aod_enabled.vote &= ~voter;
+
+	dev_dbg(&ps_msp430->client->dev, "%s (vote: 0x%x)\n", __func__,
+			ps_msp430->aod_enabled.vote);
+
+	if (ps_msp430->aod_enabled.vote == AOD_QP_ENABLED_VOTE_MASK)
+		atomic_set(&ps_msp430->qp_enabled, 1);
+	else
+		atomic_set(&ps_msp430->qp_enabled, 0);
+
+	mutex_unlock(&ps_msp430->aod_enabled.vote_lock);
+}
+
 static const struct i2c_device_id msp430_id[] = {
 	{NAME, 0},
 	{},
@@ -3269,6 +3890,84 @@ static struct of_device_id msp430_match_tbl[] = {
 };
 MODULE_DEVICE_TABLE(of, msp430_match_tbl);
 #endif
+
+static int msp430_qw_check(void *data)
+{
+	struct msp430_data *ps_msp430 = (struct msp430_data *)data;
+	unsigned short irq_status;
+	int err, ret = 0;
+
+	dev_dbg(&ps_msp430->client->dev, "msp430_qw_check\n");
+
+	if (!msp430_quickdraw_ops) {
+		dev_dbg(&ps_msp430->client->dev,
+			"no quickdraw_ops registered\n");
+		return 0;
+	}
+
+	mutex_lock(&ps_msp430->lock);
+
+	if (ps_msp430->quickpeek_state != QP_IDLE) {
+		ret = 1;
+		goto EXIT;
+	}
+
+	irq_status = msp430_get_interrupt_status(ps_msp430, WAKESENSOR_STATUS,
+		&err);
+	if (err < 0)
+		goto EXIT;
+
+	ps_msp430->qw_irq_status = irq_status;
+
+	if (irq_status & M_QUICKPEEK) {
+		wake_lock_timeout(&ps_msp430->wakelock, HZ);
+		queue_work(ps_msp430->irq_work_queue,
+			&ps_msp430->irq_wake_work);
+		ret = 1;
+	}
+
+EXIT:
+	if (ret == 1)
+		INIT_COMPLETION(ps_msp430->quickpeek_done);
+
+	mutex_unlock(&ps_msp430->lock);
+
+	return ret;
+}
+
+static int msp430_qw_execute(void *data)
+{
+	struct msp430_data *ps_msp430 = (struct msp430_data *)data;
+	int ret = 1;
+
+	dev_dbg(&ps_msp430->client->dev, "msp430_qw_execute\n");
+
+	if(!wait_for_completion_timeout(&ps_msp430->quickpeek_done,
+							AOD_QP_TIMEOUT)) {
+		dev_err(&ps_msp430->client->dev,
+			"timed out waiting for complete message, reset msp430\n");
+		msp430_reset_and_init();
+		ret = 0;
+	}
+
+	return ret;
+}
+
+static struct quickwakeup_ops msp430_quickwakeup_ops = {
+	.name = NAME,
+	.qw_execute = msp430_qw_execute,
+	.qw_check   = msp430_qw_check,
+};
+
+void msp430_register_quickdraw(struct msp430_quickdraw_ops *ops)
+{
+	msp430_quickdraw_ops = ops;
+}
+
+void msp430_unregister_quickdraw(struct msp430_quickdraw_ops *handler)
+{
+	msp430_quickdraw_ops = NULL;
+}
 
 static struct i2c_driver msp430_driver = {
 	.driver = {
