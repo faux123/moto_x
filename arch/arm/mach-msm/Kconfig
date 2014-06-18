@@ -1662,13 +1662,6 @@ config INTELLI_PLUG
 	help
 	  Generic Intelli-plug cpu hotplug driver for ARM SOCs
 
-config INTELLI_PLUG_DUAL
-	bool "Enable dual-core mode for intelliplug"
-	depends on INTELLI_PLUG
-	default n
-	help
-	  Special dual-core mode for intelli-plug
-
 config MSM_CPUFREQ_LIMITER
 	tristate "MSM CPU frequency limiter"
 	default n
