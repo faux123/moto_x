@@ -84,3 +84,10 @@ GTAGS
 *.orig
 *~
 \#*#
+
+#user ignores
+mr1mkzip.sh
+out/
+out_mr1/
+
+#
